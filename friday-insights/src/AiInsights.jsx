@@ -137,6 +137,9 @@ export default function AiInsights() {
   const [receiptError, setReceiptError] = useState("");
   const [receiptResult, setReceiptResult] = useState(null);
   const [isExportingTally, setIsExportingTally] = useState(false);
+  const [isBatchUploading, setIsBatchUploading] = useState(false);
+  const [batchUploadError, setBatchUploadError] = useState("");
+  const [batchUploadResults, setBatchUploadResults] = useState(null);
 
   useEffect(() => {
     if (!fridayAnswer) {
@@ -657,6 +660,46 @@ export default function AiInsights() {
     }
   };
 
+  const uploadBatchReceipts = async (files) => {
+    if (!files || files.length === 0) {
+      setBatchUploadError("No files selected");
+      return;
+    }
+
+    setIsBatchUploading(true);
+    setBatchUploadError("");
+    setBatchUploadResults(null);
+    
+    try {
+      const formData = new FormData();
+      Array.from(files).forEach((file) => {
+        formData.append("files", file);
+      });
+
+      const res = await fetch("/api/v1/ledger/upload-photo-batch", {
+        method: "POST",
+        headers: {
+          "X-Role": adminRole,
+          "X-Admin-Id": adminId,
+        },
+        body: formData,
+      });
+
+      const data = await res.json();
+      if (!res.ok) {
+        throw new Error(data?.detail || `Unable to process batch (${res.status})`);
+      }
+
+      setBatchUploadResults(data);
+      setWizardResult(`Batch processing complete: ${data.total_processed} entries posted, ${data.total_failed} failed.`);
+      await fetchSummary();
+    } catch (err) {
+      setBatchUploadError(err instanceof Error ? err.message : "Failed to process batch");
+    } finally {
+      setIsBatchUploading(false);
+    }
+  };
+
   const topVendors = useMemo(() => summary?.vendor_risk_ranking ?? [], [summary]);
 
   if (loading) {
@@ -833,7 +876,43 @@ export default function AiInsights() {
                   }}
                 />
               </label>
-              {receiptResult ? (
+              <label className="w-full inline-flex items-center justify-center gap-2 rounded-lg border border-cyan-700/70 bg-cyan-900/35 hover:bg-cyan-800/50 px-3 py-2 text-xs font-semibold cursor-pointer">
+                {isBatchUploading ? "Processing Batch..." : "Batch Upload (10-20 images)"}
+                <input
+                  type="file"
+                  accept="image/*"
+                  multiple
+                  disabled={isBatchUploading}
+                  className="hidden"
+                  onChange={(event) => {
+                    void uploadBatchReceipts(event.target.files);
+                    event.target.value = "";
+                  }}
+                />
+              </label>
+              {batchUploadResults ? (
+                <div className="rounded-lg border border-cyan-700/50 bg-slate-950/70 p-2 space-y-1">
+                  <p className="text-[11px] text-cyan-200 font-semibold">
+                    Batch: {batchUploadResults.total_processed} ✓ | {batchUploadResults.total_failed} ✗
+                  </p>
+                  <p className="text-[11px] text-slate-400">
+                    {batchUploadResults.processor}
+                  </p>
+                  {batchUploadResults.results && batchUploadResults.results.length > 0 && (
+                    <div className="mt-1 space-y-1 max-h-32 overflow-y-auto">
+                      {batchUploadResults.results.slice(0, 3).map((r) => (
+                        <p key={r.entry_id} className="text-[10px] text-emerald-300">
+                          {r.reference} | INR {r.amount}
+                        </p>
+                      ))}
+                      {batchUploadResults.results.length > 3 && (
+                        <p className="text-[10px] text-slate-400">+{batchUploadResults.results.length - 3} more entries</p>
+                      )}
+                    </div>
+                  )}
+                </div>
+              ) : null}
+              {receiptResult && !batchUploadResults ? (
                 <div className="rounded-lg border border-emerald-700/50 bg-slate-950/70 p-2 space-y-1">
                   <p className="text-[11px] text-emerald-200 font-semibold">
                     {receiptResult?.reference} | INR {receiptResult?.extracted?.total_amount}
@@ -853,6 +932,7 @@ export default function AiInsights() {
                 </div>
               ) : null}
               {receiptError ? <p className="text-[11px] text-red-300">{receiptError}</p> : null}
+              {batchUploadError ? <p className="text-[11px] text-red-300">{batchUploadError}</p> : null}
             </div>
           </aside>
 
