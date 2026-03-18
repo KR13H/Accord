@@ -73,6 +73,8 @@ OLLAMA_CHAT_URL = f"{OLLAMA_HOST}/api/chat"
 OLLAMA_TAGS_URL = f"{OLLAMA_HOST}/api/tags"
 OLLAMA_GENERATE_URL = f"{OLLAMA_HOST}/api/generate"
 VISION_MODEL = os.getenv("ACCORD_VISION_MODEL", "llava")
+RECON_MODEL = os.getenv("ACCORD_RECON_MODEL", "llama3.2")
+FORENSIC_MODEL = os.getenv("ACCORD_FORENSIC_MODEL", "mistral")
 
 STORAGE_ROOT = Path(__file__).resolve().parents[1] / "storage"
 RECEIPT_STORAGE_DIR = STORAGE_ROOT / "receipts"
@@ -449,6 +451,31 @@ def extract_text_with_tesseract(image_path: Path) -> str:
         return ""
 
 
+def preprocess_for_neural_ink(image_path: Path) -> tuple[Path, bool]:
+    if cv2 is None:
+        return image_path, False
+    frame = cv2.imread(str(image_path))
+    if frame is None:
+        return image_path, False
+
+    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+    denoised = cv2.fastNlMeansDenoising(gray, None, h=16, templateWindowSize=7, searchWindowSize=21)
+    boosted = cv2.convertScaleAbs(denoised, alpha=1.15, beta=5)
+    binary = cv2.adaptiveThreshold(
+        boosted,
+        255,
+        cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+        cv2.THRESH_BINARY,
+        31,
+        2,
+    )
+    staged = image_path.with_suffix(".neural.png")
+    ok = cv2.imwrite(str(staged), binary)
+    if not ok:
+        return image_path, False
+    return staged, True
+
+
 async def run_ollama_generate(*, model: str, prompt: str, image_b64: str | None = None) -> str:
     payload: dict[str, Any] = {
         "model": model,
@@ -496,6 +523,20 @@ async def extract_receipt_fields(image_path: Path, ocr_text: str) -> tuple[dict[
         return parse_structured_json(llama_raw), llama_raw
     except Exception:  # noqa: BLE001
         return {}, ""
+
+
+class NeuralInk:
+    @staticmethod
+    async def reconstruct(raw_ocr_text: str) -> tuple[dict[str, Any], str]:
+        prompt = (
+            "[INDIAN_ACCOUNTANT_MODE] Reconstruct messy OCR into strict JSON with keys: "
+            "date, vendor, gstin, total_amount, hsn, cgst, sgst, igst, confidence, notes. "
+            "Rules: gstin must be 15-char format if present, tax values numeric strings, "
+            "hsn should be 6+ digits if present, output JSON only. "
+            f"Raw OCR:\n{raw_ocr_text}"
+        )
+        raw = await run_ollama_generate(model=RECON_MODEL, prompt=prompt)
+        return parse_structured_json(raw), raw
 
 
 class JournalLineIn(BaseModel):
@@ -630,6 +671,7 @@ def init_db() -> None:
                 filed_export_hash TEXT NULL,
                 approved_by_1 INTEGER NULL,
                 approved_by_2 INTEGER NULL,
+                entry_fingerprint TEXT NULL,
                 created_at TEXT NOT NULL
             );
 
@@ -903,6 +945,9 @@ def migrate_legacy_schema(conn: sqlite3.Connection) -> None:
 
     if not table_has_column(conn, "journal_entries", "approved_by_2"):
         conn.execute("ALTER TABLE journal_entries ADD COLUMN approved_by_2 INTEGER NULL;")
+
+    if not table_has_column(conn, "journal_entries", "entry_fingerprint"):
+        conn.execute("ALTER TABLE journal_entries ADD COLUMN entry_fingerprint TEXT NULL;")
 
     if not table_has_column(conn, "audit_edit_logs", "high_priority"):
         conn.execute(
@@ -1236,6 +1281,84 @@ def build_integrity_hash(reference: str, lines: list[sqlite3.Row]) -> str:
     }
     digest = sha256(json.dumps(payload, sort_keys=True).encode("utf-8")).hexdigest()
     return digest
+
+
+def stamp_entry_fingerprint(conn: sqlite3.Connection, entry_id: int) -> str:
+    entry = conn.execute("SELECT reference FROM journal_entries WHERE id = ?", (entry_id,)).fetchone()
+    if entry is None:
+        return ""
+
+    lines = conn.execute(
+        """
+        SELECT account_id, debit, credit
+        FROM journal_lines
+        WHERE entry_id = ?
+        ORDER BY id ASC
+        """,
+        (entry_id,),
+    ).fetchall()
+    if not lines:
+        return ""
+
+    digest = build_integrity_hash(str(entry["reference"]), lines)
+    conn.execute("UPDATE journal_entries SET entry_fingerprint = ? WHERE id = ?", (digest, entry_id))
+    return digest
+
+
+def generate_tally_export(conn: sqlite3.Connection, entry_id: int) -> tuple[bytes, str, Path, str, str]:
+    entry = conn.execute(
+        """
+        SELECT id, date, reference, description, status
+        FROM journal_entries
+        WHERE id = ?
+        """,
+        (entry_id,),
+    ).fetchone()
+    if entry is None:
+        raise HTTPException(status_code=404, detail="Journal entry not found")
+
+    lines = conn.execute(
+        """
+        SELECT jl.debit, jl.credit, a.name
+        FROM journal_lines jl
+        JOIN accounts a ON a.id = jl.account_id
+        WHERE jl.entry_id = ?
+        ORDER BY jl.id ASC
+        """,
+        (entry_id,),
+    ).fetchall()
+    if not lines:
+        raise HTTPException(status_code=422, detail="Entry has no journal lines")
+
+    envelope = ET.Element("ENVELOPE")
+    header = ET.SubElement(envelope, "HEADER")
+    ET.SubElement(header, "TALLYREQUEST").text = "Import Data"
+
+    body = ET.SubElement(envelope, "BODY")
+    import_data = ET.SubElement(body, "IMPORTDATA")
+    request_desc = ET.SubElement(import_data, "REQUESTDESC")
+    ET.SubElement(request_desc, "REPORTNAME").text = "Vouchers"
+    request_data = ET.SubElement(import_data, "REQUESTDATA")
+
+    tally_message = ET.SubElement(request_data, "TALLYMESSAGE")
+    voucher = ET.SubElement(tally_message, "VOUCHER", {"VCHTYPE": "Journal", "ACTION": "Create"})
+    ET.SubElement(voucher, "DATE").text = str(entry["date"]).replace("-", "")
+    ET.SubElement(voucher, "NARRATION").text = str(entry["description"] or "Vision Ledger Import")
+    ET.SubElement(voucher, "VOUCHERNUMBER").text = str(entry["reference"])
+
+    for line in lines:
+        amount = money(line["debit"]) - money(line["credit"])
+        ledger_entry = ET.SubElement(voucher, "ALLLEDGERENTRIES.LIST")
+        ET.SubElement(ledger_entry, "LEDGERNAME").text = str(line["name"])
+        ET.SubElement(ledger_entry, "ISDEEMEDPOSITIVE").text = "Yes" if amount < 0 else "No"
+        ET.SubElement(ledger_entry, "AMOUNT").text = f"{amount:.4f}"
+
+    xml_bytes = ET.tostring(envelope, encoding="utf-8", xml_declaration=True)
+    filename = f"Accord_Tally_Export_{entry['reference']}.xml"
+    TALLY_EXPORT_DIR.mkdir(parents=True, exist_ok=True)
+    export_path = TALLY_EXPORT_DIR / filename
+    export_path.write_bytes(xml_bytes)
+    return xml_bytes, filename, export_path, str(entry["reference"]), str(entry["status"])
 
 
 def get_audit_header(reference_no: str, period_label: str | None, period_is_locked: bool, lines: list[sqlite3.Row]) -> dict[str, Any]:
@@ -2036,6 +2159,7 @@ async def upload_photo_to_ledger(
                 (entry_id, payable_id, money_str(Decimal("0")), money_str(amount)),
             )
             update_account_balance(conn, payable_id, Decimal("0"), amount)
+            fingerprint = stamp_entry_fingerprint(conn, entry_id)
 
             conn.execute(
                 """
@@ -2065,6 +2189,7 @@ async def upload_photo_to_ledger(
                     "gstin": gstin,
                     "hsn": hsn,
                     "amount": money_str(amount),
+                    "entry_fingerprint": fingerprint,
                     "receipt_file": str(image_path),
                     "actor_role": role,
                 },
@@ -2092,6 +2217,179 @@ async def upload_photo_to_ledger(
             "total_amount": money_str(amount),
             "confidence": extracted.get("confidence", ""),
             "notes": extracted.get("notes", ""),
+            "entry_fingerprint": fingerprint,
+        },
+    }
+
+
+@app.post("/api/v1/ledger/neural-ink")
+async def neural_ink_to_ledger(
+    file: UploadFile = File(...),
+    x_role: str | None = Header(default=None, alias="X-Role"),
+    x_admin_id: str | None = Header(default=None, alias="X-Admin-Id"),
+) -> dict[str, Any]:
+    role = require_role(x_role, {"admin", "ca"})
+    admin_id = require_admin_id(x_admin_id)
+
+    if not file.filename:
+        raise HTTPException(status_code=400, detail="Missing file name")
+    content_type = (file.content_type or "").lower()
+    if not (content_type.startswith("image/") or file.filename.lower().endswith((".png", ".jpg", ".jpeg", ".webp"))):
+        raise HTTPException(status_code=422, detail="Only image uploads are supported")
+
+    RECEIPT_STORAGE_DIR.mkdir(parents=True, exist_ok=True)
+    ext = Path(file.filename).suffix.lower() or ".jpg"
+    safe_name = f"neural_{datetime.utcnow().strftime('%Y%m%dT%H%M%S')}_{uuid.uuid4().hex}{ext}"
+    image_path = RECEIPT_STORAGE_DIR / safe_name
+
+    raw = await file.read()
+    if len(raw) == 0:
+        raise HTTPException(status_code=400, detail="Uploaded file is empty")
+    image_path.write_bytes(raw)
+
+    preprocessed_path, preprocessed = preprocess_for_neural_ink(image_path)
+    ocr_text = extract_text_with_tesseract(preprocessed_path)
+    if not ocr_text:
+        raise HTTPException(status_code=422, detail="Unable to extract OCR text from image")
+
+    extracted, model_response = await NeuralInk.reconstruct(ocr_text)
+    imported_date = parse_date_from_text(str(extracted.get("date", "")))
+    vendor_name = str(extracted.get("vendor", "")).strip() or "Neural Ink Vendor"
+    gstin = str(extracted.get("gstin", "")).strip().upper()
+    hsn = str(extracted.get("hsn", "")).strip()
+    amount = parse_amount_from_text(str(extracted.get("total_amount", "0")))
+    if amount <= 0:
+        amount = parse_amount_from_text(ocr_text)
+    if amount <= 0:
+        raise HTTPException(status_code=422, detail="Unable to detect a valid receipt amount")
+
+    with closing(get_conn()) as conn:
+        try:
+            check_period_lock(conn, imported_date)
+            reference = next_journal_reference(conn, imported_date)
+            purchases_id = get_account_id_by_name(conn, "Purchases")
+            payable_id = get_account_id_by_name(conn, "Accounts Payable")
+
+            created_at = datetime.utcnow().isoformat(timespec="seconds") + "Z"
+            cursor = conn.execute(
+                """
+                INSERT INTO journal_entries(
+                    date,
+                    reference,
+                    description,
+                    company_state_code,
+                    counterparty_state_code,
+                    counterparty_gstin,
+                    eco_gstin,
+                    supply_source,
+                    ims_status,
+                    vendor_legal_name,
+                    vendor_gstr1_filed_at,
+                    status,
+                    reversal_of_id,
+                    is_filed,
+                    filed_at,
+                    filed_export_hash,
+                    approved_by_1,
+                    approved_by_2,
+                    created_at
+                ) VALUES (?, ?, ?, NULL, NULL, ?, NULL, 'DIRECT', 'PENDING', ?, NULL, 'POSTED', NULL, 0, NULL, NULL, NULL, NULL, ?)
+                """,
+                (
+                    imported_date.isoformat(),
+                    reference,
+                    f"Neural-Ink handwritten import: {vendor_name}",
+                    gstin or None,
+                    vendor_name,
+                    created_at,
+                ),
+            )
+            entry_id = int(cursor.lastrowid)
+
+            conn.execute(
+                "INSERT INTO journal_lines(entry_id, account_id, debit, credit) VALUES (?, ?, ?, ?)",
+                (entry_id, purchases_id, money_str(amount), money_str(Decimal("0"))),
+            )
+            update_account_balance(conn, purchases_id, amount, Decimal("0"))
+
+            conn.execute(
+                "INSERT INTO journal_lines(entry_id, account_id, debit, credit) VALUES (?, ?, ?, ?)",
+                (entry_id, payable_id, money_str(Decimal("0")), money_str(amount)),
+            )
+            update_account_balance(conn, payable_id, Decimal("0"), amount)
+            fingerprint = stamp_entry_fingerprint(conn, entry_id)
+
+            conn.execute(
+                """
+                INSERT INTO receipt_imports(entry_id, file_path, ocr_text, extracted_json, model_response, status, created_by, created_at)
+                VALUES (?, ?, ?, ?, ?, 'NEURAL_INK', ?, ?)
+                """,
+                (
+                    entry_id,
+                    str(image_path),
+                    ocr_text,
+                    json.dumps(extracted) if extracted else None,
+                    model_response,
+                    admin_id,
+                    created_at,
+                ),
+            )
+
+            _, filename, export_path, _, _ = generate_tally_export(conn, entry_id)
+
+            log_audit(
+                conn,
+                table_name="journal_entries",
+                record_id=entry_id,
+                action="NEURAL_INK_IMPORT",
+                old_value=None,
+                new_value={
+                    "reference": reference,
+                    "vendor": vendor_name,
+                    "gstin": gstin,
+                    "hsn": hsn,
+                    "amount": money_str(amount),
+                    "entry_fingerprint": fingerprint,
+                    "receipt_file": str(image_path),
+                    "tally_export": str(export_path),
+                    "preprocessed": preprocessed,
+                    "actor_role": role,
+                },
+                user_id=admin_id,
+                high_priority=True,
+            )
+            conn.commit()
+        except HTTPException:
+            conn.rollback()
+            raise
+        except Exception as exc:  # noqa: BLE001
+            conn.rollback()
+            raise HTTPException(status_code=500, detail=f"Failed Neural-Ink import: {exc}") from exc
+        finally:
+            if preprocessed and preprocessed_path != image_path:
+                preprocessed_path.unlink(missing_ok=True)
+
+    return {
+        "status": "processed",
+        "pipeline": "Neural-Ink",
+        "entry_id": entry_id,
+        "reference": reference,
+        "entry_fingerprint": fingerprint,
+        "tally_export_file": filename,
+        "tally_export_path": str(export_path),
+        "ocr_preview": ocr_text[:600],
+        "preprocessed_with_opencv": preprocessed,
+        "extracted": {
+            "date": imported_date.isoformat(),
+            "vendor": vendor_name,
+            "gstin": gstin,
+            "hsn": hsn,
+            "total_amount": money_str(amount),
+            "cgst": extracted.get("cgst", ""),
+            "sgst": extracted.get("sgst", ""),
+            "igst": extracted.get("igst", ""),
+            "confidence": extracted.get("confidence", ""),
+            "notes": extracted.get("notes", ""),
         },
     }
 
@@ -2106,58 +2404,7 @@ def export_tally_xml(
     admin_id = require_admin_id(x_admin_id)
 
     with closing(get_conn()) as conn:
-        entry = conn.execute(
-            """
-            SELECT id, date, reference, description, status
-            FROM journal_entries
-            WHERE id = ?
-            """,
-            (entry_id,),
-        ).fetchone()
-        if entry is None:
-            raise HTTPException(status_code=404, detail="Journal entry not found")
-
-        lines = conn.execute(
-            """
-            SELECT jl.debit, jl.credit, a.name
-            FROM journal_lines jl
-            JOIN accounts a ON a.id = jl.account_id
-            WHERE jl.entry_id = ?
-            ORDER BY jl.id ASC
-            """,
-            (entry_id,),
-        ).fetchall()
-        if not lines:
-            raise HTTPException(status_code=422, detail="Entry has no journal lines")
-
-        envelope = ET.Element("ENVELOPE")
-        header = ET.SubElement(envelope, "HEADER")
-        ET.SubElement(header, "TALLYREQUEST").text = "Import Data"
-
-        body = ET.SubElement(envelope, "BODY")
-        import_data = ET.SubElement(body, "IMPORTDATA")
-        request_desc = ET.SubElement(import_data, "REQUESTDESC")
-        ET.SubElement(request_desc, "REPORTNAME").text = "Vouchers"
-        request_data = ET.SubElement(import_data, "REQUESTDATA")
-
-        tally_message = ET.SubElement(request_data, "TALLYMESSAGE")
-        voucher = ET.SubElement(tally_message, "VOUCHER", {"VCHTYPE": "Journal", "ACTION": "Create"})
-        ET.SubElement(voucher, "DATE").text = str(entry["date"]).replace("-", "")
-        ET.SubElement(voucher, "NARRATION").text = str(entry["description"] or "Vision Ledger Import")
-        ET.SubElement(voucher, "VOUCHERNUMBER").text = str(entry["reference"])
-
-        for line in lines:
-            amount = money(line["debit"]) - money(line["credit"])
-            ledger_entry = ET.SubElement(voucher, "ALLLEDGERENTRIES.LIST")
-            ET.SubElement(ledger_entry, "LEDGERNAME").text = str(line["name"])
-            ET.SubElement(ledger_entry, "ISDEEMEDPOSITIVE").text = "Yes" if amount < 0 else "No"
-            ET.SubElement(ledger_entry, "AMOUNT").text = f"{amount:.4f}"
-
-        xml_bytes = ET.tostring(envelope, encoding="utf-8", xml_declaration=True)
-        TALLY_EXPORT_DIR.mkdir(parents=True, exist_ok=True)
-        filename = f"Accord_Tally_Export_{entry['reference']}.xml"
-        export_path = TALLY_EXPORT_DIR / filename
-        export_path.write_bytes(xml_bytes)
+        xml_bytes, filename, export_path, reference, entry_status = generate_tally_export(conn, entry_id)
 
         log_audit(
             conn,
@@ -2166,8 +2413,8 @@ def export_tally_xml(
             action="TALLY_XML_EXPORT",
             old_value=None,
             new_value={
-                "reference": entry["reference"],
-                "entry_status": entry["status"],
+                "reference": reference,
+                "entry_status": entry_status,
                 "export_file": str(export_path),
                 "actor_role": role,
             },
@@ -2261,6 +2508,7 @@ def process_receipt_batch_worker(
                     (entry_id, payable_id, money_str(Decimal("0")), money_str(amount)),
                 )
                 update_account_balance(conn, payable_id, Decimal("0"), amount)
+                fingerprint = stamp_entry_fingerprint(conn, entry_id)
 
                 conn.execute(
                     """
@@ -2290,6 +2538,7 @@ def process_receipt_batch_worker(
                         "gstin": gstin,
                         "hsn": hsn,
                         "amount": money_str(amount),
+                        "entry_fingerprint": fingerprint,
                         "receipt_file": str(image_path),
                     },
                     user_id=admin_id_val,
@@ -2303,6 +2552,7 @@ def process_receipt_batch_worker(
                     "reference": reference,
                     "vendor": vendor_name,
                     "amount": money_str(amount),
+                    "entry_fingerprint": fingerprint,
                 }
             except HTTPException as hex_exc:
                 conn.rollback()
@@ -2778,6 +3028,8 @@ def post_journal(payload: JournalEntryIn) -> dict[str, Any]:
 
                 update_account_balance(conn, line.account_id, debit, credit)
 
+            fingerprint = stamp_entry_fingerprint(conn, entry_id)
+
             conn.execute(
                 """
                 INSERT INTO tax_ledger(
@@ -2830,6 +3082,7 @@ def post_journal(payload: JournalEntryIn) -> dict[str, Any]:
                     "ims_status": ims_status,
                     "vendor_legal_name": vendor_legal_name,
                     "vendor_gstr1_filed_at": vendor_filed_at,
+                    "entry_fingerprint": fingerprint,
                 },
             )
 
@@ -2851,6 +3104,7 @@ def post_journal(payload: JournalEntryIn) -> dict[str, Any]:
         "reference": reference,
         "period_status": "OPEN",
         "is_auditable": False,
+        "entry_fingerprint": fingerprint,
     }
 
 
@@ -2916,6 +3170,8 @@ def reverse_journal(entry_id: int, payload: ReversalIn) -> dict[str, Any]:
                 )
                 update_account_balance(conn, line["account_id"], reversal_debit, reversal_credit)
 
+            reversal_fingerprint = stamp_entry_fingerprint(conn, reversal_id)
+
             conn.execute("UPDATE journal_entries SET status = 'REVERSED' WHERE id = ?", (entry_id,))
 
             log_audit(
@@ -2933,7 +3189,11 @@ def reverse_journal(entry_id: int, payload: ReversalIn) -> dict[str, Any]:
                 record_id=reversal_id,
                 action="CREATE",
                 old_value=None,
-                new_value={"reversal_of_id": entry_id, "reason": payload.reason.strip()},
+                new_value={
+                    "reversal_of_id": entry_id,
+                    "reason": payload.reason.strip(),
+                    "entry_fingerprint": reversal_fingerprint,
+                },
             )
 
             conn.commit()
@@ -2950,6 +3210,7 @@ def reverse_journal(entry_id: int, payload: ReversalIn) -> dict[str, Any]:
         "reversal_entry_id": reversal_id,
         "period_status": "OPEN",
         "is_auditable": False,
+        "entry_fingerprint": reversal_fingerprint,
     }
 
 
@@ -4016,6 +4277,95 @@ async def post_ask_friday(payload: AskFridayIn) -> dict[str, Any]:
     }
 
 
+@app.get("/api/v1/insights/forensic-audit")
+async def get_forensic_audit(
+    limit: int = 200,
+    x_role: str | None = Header(default=None, alias="X-Role"),
+    x_admin_id: str | None = Header(default=None, alias="X-Admin-Id"),
+) -> dict[str, Any]:
+    role = require_role(x_role, {"admin", "ca"})
+    admin_id = require_admin_id(x_admin_id)
+    safe_limit = min(max(limit, 20), 2000)
+
+    with closing(get_conn()) as conn:
+        rows = conn.execute(
+            """
+            SELECT je.id, je.reference, je.date, je.description, je.entry_fingerprint,
+                   GROUP_CONCAT(
+                     CASE WHEN jl.debit != '0.0000'
+                          THEN a.name || ':DR:' || jl.debit
+                          ELSE a.name || ':CR:' || jl.credit END,
+                     ' | '
+                   ) AS line_summary
+            FROM journal_entries je
+            JOIN journal_lines jl ON jl.entry_id = je.id
+            JOIN accounts a ON a.id = jl.account_id
+            GROUP BY je.id, je.reference, je.date, je.description, je.entry_fingerprint
+            ORDER BY je.id DESC
+            LIMIT ?
+            """,
+            (safe_limit,),
+        ).fetchall()
+
+    dataset = [
+        {
+            "entry_id": int(row["id"]),
+            "reference": row["reference"],
+            "date": row["date"],
+            "description": row["description"],
+            "entry_fingerprint": row["entry_fingerprint"],
+            "line_summary": row["line_summary"],
+        }
+        for row in rows
+    ]
+
+    prompt = (
+        "Audit these journal rows for anomalies. Return strict JSON with keys: "
+        "risk_score (0-100), flagged_entries (array of {entry_id, issue, severity}), summary. "
+        "Focus on suspicious duplicates, round-tripping patterns, and mismatched narration/ledger intent.\n"
+        f"Rows: {json.dumps(dataset, separators=(',', ':'))}"
+    )
+
+    model_used = FORENSIC_MODEL
+    audit_raw = ""
+    try:
+        audit_raw = await run_ollama_generate(model=FORENSIC_MODEL, prompt=prompt)
+    except Exception:  # noqa: BLE001
+        model_used = RECON_MODEL
+        audit_raw = await run_ollama_generate(model=RECON_MODEL, prompt=prompt)
+
+    parsed = parse_structured_json(audit_raw)
+    flagged_entries = parsed.get("flagged_entries") if isinstance(parsed.get("flagged_entries"), list) else []
+
+    with closing(get_conn()) as conn:
+        conn.execute("BEGIN")
+        log_audit(
+            conn,
+            table_name="reports",
+            record_id=0,
+            action="FORENSIC_AUDIT_RUN",
+            old_value=None,
+            new_value={
+                "entries_scanned": len(dataset),
+                "flagged_count": len(flagged_entries),
+                "model": model_used,
+                "actor_role": role,
+            },
+            user_id=admin_id,
+            high_priority=True,
+        )
+        conn.commit()
+
+    return {
+        "status": "ok",
+        "model": model_used,
+        "entries_scanned": len(dataset),
+        "risk_score": parsed.get("risk_score", 0),
+        "summary": parsed.get("summary", "No summary returned."),
+        "flagged_entries": flagged_entries,
+    }
+
+
 @app.post("/api/v1/gstn/ecl-bridge")
 async def post_gstn_ecl_bridge(
     payload: GstnEclBridgeIn,
@@ -4273,6 +4623,7 @@ def post_generate_reversal_37a(
                 (entry_id, gst_input_account_id, money_str(Decimal("0")), money_str(risk_amount)),
             )
             update_account_balance(conn, gst_input_account_id, Decimal("0"), risk_amount)
+            fingerprint = stamp_entry_fingerprint(conn, entry_id)
 
             log_audit(
                 conn,
@@ -4283,6 +4634,7 @@ def post_generate_reversal_37a(
                 new_value={
                     "reference": reference,
                     "risk_amount": money_str(risk_amount),
+                    "entry_fingerprint": fingerprint,
                     "source_references": risk["rule_37a"]["at_risk_references"],
                     "hard_stop": risk["rule_37a"]["hard_stop"],
                     "actor_role": role,
@@ -4306,6 +4658,7 @@ def post_generate_reversal_37a(
         "reference": reference,
         "reversal_amount": money_str(risk_amount),
         "source_references": risk["rule_37a"]["at_risk_references"],
+        "entry_fingerprint": fingerprint,
     }
 
 

@@ -98,6 +98,46 @@ function ComplianceGauge({ score }) {
   );
 }
 
+function M3CoreMonitor({ pulse, activeWorkers, mistralReady }) {
+  const workerLoad = Math.min(100, 28 + activeWorkers * 7 + (pulse % 18));
+  const efficiencyLoad = Math.min(100, 24 + Math.floor(workerLoad * 0.82));
+  const neuralLoad = Math.min(100, 34 + Math.floor(workerLoad * 0.9));
+  const signals = [
+    { key: "perf", label: "Performance Cores", value: workerLoad, tone: "bg-cyan-300" },
+    { key: "eff", label: "Efficiency Cores", value: efficiencyLoad, tone: "bg-emerald-300" },
+    { key: "neural", label: "Neural Engine", value: neuralLoad, tone: "bg-amber-300" },
+  ];
+
+  return (
+    <div className="rounded-2xl border border-white/20 bg-black/70 p-4 glass-panel">
+      <div className="flex items-center justify-between gap-3">
+        <p className="text-xs uppercase tracking-[0.22em] text-cyan-200">M3 Core Monitor</p>
+        <span className={`text-[10px] font-semibold tracking-[0.18em] ${mistralReady ? "text-emerald-300" : "text-amber-300"}`}>
+          {mistralReady ? "MISTRAL READY" : "MISTRAL WARMING"}
+        </span>
+      </div>
+      <div className="mt-3 space-y-2">
+        {signals.map((signal) => (
+          <div key={signal.key}>
+            <div className="flex items-center justify-between text-[11px] text-slate-300">
+              <span>{signal.label}</span>
+              <span className="mono-metrics">{signal.value}%</span>
+            </div>
+            <div className="h-2 rounded-full bg-slate-900/90 overflow-hidden mt-1">
+              <motion.div
+                className={`h-full ${signal.tone}`}
+                animate={{ width: `${signal.value}%`, opacity: [0.5, 1, 0.65] }}
+                transition={{ duration: 0.75, ease: "easeOut" }}
+              />
+            </div>
+          </div>
+        ))}
+      </div>
+      <p className="mt-3 text-[11px] text-slate-400">Active workers: {activeWorkers} / 10</p>
+    </div>
+  );
+}
+
 export default function AiInsights() {
   const [summary, setSummary] = useState(null);
   const [loading, setLoading] = useState(true);
@@ -140,6 +180,14 @@ export default function AiInsights() {
   const [isBatchUploading, setIsBatchUploading] = useState(false);
   const [batchUploadError, setBatchUploadError] = useState("");
   const [batchUploadResults, setBatchUploadResults] = useState(null);
+  const [isNeuralInking, setIsNeuralInking] = useState(false);
+  const [neuralInkError, setNeuralInkError] = useState("");
+  const [neuralInkResult, setNeuralInkResult] = useState(null);
+  const [forensicAudit, setForensicAudit] = useState(null);
+  const [forensicError, setForensicError] = useState("");
+  const [isForensicLoading, setIsForensicLoading] = useState(false);
+  const [mistralReady, setMistralReady] = useState(false);
+  const [corePulse, setCorePulse] = useState(0);
 
   useEffect(() => {
     if (!fridayAnswer) {
@@ -157,6 +205,77 @@ export default function AiInsights() {
     }, 14);
     return () => clearInterval(timer);
   }, [fridayAnswer]);
+
+  useEffect(() => {
+    const timer = setInterval(() => {
+      setCorePulse((value) => (value + 7) % 1000);
+    }, 900);
+    return () => clearInterval(timer);
+  }, []);
+
+  const refreshModelHealth = async () => {
+    try {
+      const res = await fetch("/api/v1/insights/friday-health?model=mistral");
+      const data = await res.json();
+      setMistralReady(Boolean(data?.model_ready));
+    } catch {
+      setMistralReady(false);
+    }
+  };
+
+  const fetchForensicAudit = async () => {
+    setIsForensicLoading(true);
+    setForensicError("");
+    try {
+      const res = await fetch("/api/v1/insights/forensic-audit?limit=250", {
+        headers: {
+          "X-Role": adminRole,
+          "X-Admin-Id": adminId,
+        },
+      });
+      const data = await res.json();
+      if (!res.ok) {
+        throw new Error(data?.detail || `Forensic audit failed (${res.status})`);
+      }
+      setForensicAudit(data);
+    } catch (err) {
+      setForensicError(err instanceof Error ? err.message : "Failed to load forensic audit");
+    } finally {
+      setIsForensicLoading(false);
+    }
+  };
+
+  const uploadNeuralInk = async (file) => {
+    if (!file) {
+      return;
+    }
+    setIsNeuralInking(true);
+    setNeuralInkError("");
+    setNeuralInkResult(null);
+    try {
+      const formData = new FormData();
+      formData.append("file", file);
+      const res = await fetch("/api/v1/ledger/neural-ink", {
+        method: "POST",
+        headers: {
+          "X-Role": adminRole,
+          "X-Admin-Id": adminId,
+        },
+        body: formData,
+      });
+      const data = await res.json();
+      if (!res.ok) {
+        throw new Error(data?.detail || `Neural-Ink failed (${res.status})`);
+      }
+      setNeuralInkResult(data);
+      setWizardResult(`Neural-Ink posted ${data.reference} and generated ${data.tally_export_file}.`);
+      await fetchSummary();
+    } catch (err) {
+      setNeuralInkError(err instanceof Error ? err.message : "Failed to run Neural-Ink");
+    } finally {
+      setIsNeuralInking(false);
+    }
+  };
 
   const buildNudgeMessage = (vendor) => {
     const monthLabel = new Date().toLocaleString("en-IN", { month: "short", year: "numeric" });
@@ -278,6 +397,11 @@ export default function AiInsights() {
   useEffect(() => {
     void fetchSummary();
   }, [includeFiled, minMonthlyBalance]);
+
+  useEffect(() => {
+    void refreshModelHealth();
+    void fetchForensicAudit();
+  }, [adminRole, adminId]);
 
   const runReversalWizard = async () => {
     if (!window.confirm("Generate Rule 37A reversal journals now?")) {
@@ -704,7 +828,7 @@ export default function AiInsights() {
 
   if (loading) {
     return (
-      <div className="min-h-screen bg-slate-950 text-slate-200 flex items-center justify-center gap-3">
+      <div className="min-h-screen bg-black text-white flex items-center justify-center gap-3">
         <Loader2 className="w-5 h-5 animate-spin" />
         <span className="text-sm tracking-wide">Loading Accord Intelligence...</span>
       </div>
@@ -713,7 +837,7 @@ export default function AiInsights() {
 
   if (error) {
     return (
-      <div className="min-h-screen bg-slate-950 text-slate-200 flex items-center justify-center p-6">
+      <div className="min-h-screen bg-black text-white flex items-center justify-center p-6">
         <div className="max-w-lg w-full rounded-2xl border border-red-500/40 bg-red-500/10 p-6">
           <p className="text-red-200 font-semibold">Failed to load insights</p>
           <p className="text-sm text-red-100/90 mt-1">{error}</p>
@@ -744,6 +868,11 @@ export default function AiInsights() {
     const hardStopPenalty = critical ? 25 : 0;
     return Math.max(5, 100 - riskPenalty - pendingPenalty - hardStopPenalty);
   }, [summary, critical]);
+  const activeWorkers = isBatchUploading
+    ? 10
+    : isUploadingReceipt || isNeuralInking
+      ? 4
+      : Math.min(6, Number(forensicAudit?.flagged_entries?.length || 0));
 
   const radarSignals = [
     {
@@ -767,7 +896,7 @@ export default function AiInsights() {
   ];
 
   return (
-    <div className="ai-shell min-h-screen bg-slate-950 text-slate-100">
+    <div className="ai-shell min-h-screen bg-black text-white">
       <div className="mx-auto max-w-[96rem] px-4 sm:px-6 lg:px-8 py-8">
         <div className="grid grid-cols-1 xl:grid-cols-[320px_minmax(0,1fr)] gap-6">
           <aside className="ai-sidebar ai-reveal rounded-3xl border border-white/10 bg-white/5 backdrop-blur-xl p-4 sm:p-5 space-y-5 h-fit xl:sticky xl:top-6" data-delay="1">
@@ -890,6 +1019,21 @@ export default function AiInsights() {
                   }}
                 />
               </label>
+              <label className="w-full inline-flex items-center justify-center gap-2 rounded-lg border border-fuchsia-700/70 bg-fuchsia-900/35 hover:bg-fuchsia-800/50 px-3 py-2 text-xs font-semibold cursor-pointer">
+                {isNeuralInking ? "Running Neural-Ink..." : "Neural-Ink (Handwriting)"}
+                <input
+                  type="file"
+                  accept="image/*"
+                  capture="environment"
+                  disabled={isNeuralInking}
+                  className="hidden"
+                  onChange={(event) => {
+                    const picked = event.target.files?.[0];
+                    void uploadNeuralInk(picked);
+                    event.target.value = "";
+                  }}
+                />
+              </label>
               {batchUploadResults ? (
                 <div className="rounded-lg border border-cyan-700/50 bg-slate-950/70 p-2 space-y-1">
                   <p className="text-[11px] text-cyan-200 font-semibold">
@@ -931,8 +1075,23 @@ export default function AiInsights() {
                   </button>
                 </div>
               ) : null}
+              {neuralInkResult ? (
+                <div className="rounded-lg border border-fuchsia-700/50 bg-slate-950/70 p-2 space-y-1">
+                  <p className="text-[11px] text-fuchsia-200 font-semibold">
+                    {neuralInkResult.reference} | Fingerprint {String(neuralInkResult.entry_fingerprint || "").slice(0, 12)}...
+                  </p>
+                  <p className="text-[11px] text-slate-400 truncate">
+                    {neuralInkResult.extracted?.vendor || "Vendor unknown"}
+                    {neuralInkResult.extracted?.gstin ? ` | ${neuralInkResult.extracted.gstin}` : ""}
+                  </p>
+                  <p className="text-[10px] text-slate-500 truncate">
+                    {neuralInkResult.tally_export_file}
+                  </p>
+                </div>
+              ) : null}
               {receiptError ? <p className="text-[11px] text-red-300">{receiptError}</p> : null}
               {batchUploadError ? <p className="text-[11px] text-red-300">{batchUploadError}</p> : null}
+              {neuralInkError ? <p className="text-[11px] text-red-300">{neuralInkError}</p> : null}
             </div>
           </aside>
 
@@ -943,11 +1102,14 @@ export default function AiInsights() {
             <h1 className="text-2xl sm:text-3xl font-bold tracking-tight">Cash-Flow Protection Command Center</h1>
             <p className="text-sm text-slate-400 mt-1">As of {summary?.as_of_date}</p>
           </div>
-          <div className="rounded-xl border border-slate-800 bg-slate-900/70 px-4 py-3">
-            <p className="text-xs text-slate-400">Potential Interest Savings</p>
-            <p className="text-xl font-mono font-bold text-emerald-300">
-              {formatINR(summary?.summary?.total_potential_interest_savings)}
-            </p>
+          <div className="grid grid-cols-1 sm:grid-cols-2 gap-3 w-full sm:w-auto">
+            <div className="rounded-xl border border-white/15 bg-black/70 px-4 py-3 glass-panel">
+              <p className="text-xs text-slate-400">Potential Interest Savings</p>
+              <p className="text-xl font-mono font-bold text-emerald-300">
+                {formatINR(summary?.summary?.total_potential_interest_savings)}
+              </p>
+            </div>
+            <M3CoreMonitor pulse={corePulse} activeWorkers={activeWorkers} mistralReady={mistralReady} />
           </div>
         </header>
 
@@ -1148,54 +1310,93 @@ export default function AiInsights() {
             {reversalEntries.length === 0 ? (
               <p className="text-sm text-slate-400">No reversal batches found for this view.</p>
             ) : (
-              reversalEntries.map((entry) => (
-                <div
-                  key={entry.entry_id}
-                  className={`rounded-xl border px-4 py-3 flex flex-col gap-2 md:flex-row md:items-center md:justify-between ${
-                    entry.is_filed
-                      ? "border-slate-700 bg-slate-950/40 opacity-60 grayscale"
-                      : "border-slate-800 bg-slate-950/80"
-                  }`}
-                >
-                  <div className="space-y-2">
-                    <p className="font-medium">{entry.reference}</p>
-                    <p className="text-xs text-slate-500">Created: {formatDateTime(entry.reversal_created_at)}</p>
-                    <p className="text-xs text-slate-500">Amount: {formatINR(entry.reversal_amount)}</p>
-                    <div className="rounded-lg border border-slate-800 bg-slate-950/70 px-3 py-2">
-                      <p className="text-[11px] text-slate-400 mb-1">Chain of Control</p>
-                      <p className="text-[11px] text-slate-300">
-                        Created: {entry.approval_timeline?.created_by ? `Admin-${entry.approval_timeline.created_by}` : "-"} @ {formatDateTime(entry.approval_timeline?.timestamps?.created_at)}
-                      </p>
-                      <p className="text-[11px] text-slate-300">
-                        Exported: {entry.approval_timeline?.exported_by ? `Admin-${entry.approval_timeline.exported_by}` : "-"} @ {formatDateTime(entry.approval_timeline?.timestamps?.exported_at)}
-                      </p>
-                      <p className="text-[11px] text-slate-300">
-                        Verified: {entry.approval_timeline?.verified_by ? `Admin-${entry.approval_timeline.verified_by}` : "-"} @ {formatDateTime(entry.approval_timeline?.timestamps?.verified_at)}
-                      </p>
-                      <p className="text-[11px] text-slate-300">
-                        2nd Approval: {entry.approval_timeline?.approved_by_2 ? `Admin-${entry.approval_timeline.approved_by_2}` : "-"} @ {formatDateTime(entry.approval_timeline?.timestamps?.approved_at)}
-                      </p>
+              <AnimatePresence initial={false}>
+                {reversalEntries.map((entry) => (
+                  <motion.div
+                    key={entry.entry_id}
+                    layout
+                    initial={{ opacity: 0, x: 28 }}
+                    animate={{ opacity: 1, x: 0 }}
+                    exit={{ opacity: 0, x: -18 }}
+                    transition={{ duration: 0.28, ease: "easeOut" }}
+                    className={`rounded-xl border px-4 py-3 flex flex-col gap-2 md:flex-row md:items-center md:justify-between ${
+                      entry.is_filed
+                        ? "border-slate-700 bg-slate-950/40 opacity-60 grayscale"
+                        : "border-slate-800 bg-slate-950/80"
+                    }`}
+                  >
+                    <div className="space-y-2">
+                      <p className="font-medium">{entry.reference}</p>
+                      <p className="text-xs text-slate-500">Created: {formatDateTime(entry.reversal_created_at)}</p>
+                      <p className="text-xs text-slate-500">Amount: {formatINR(entry.reversal_amount)}</p>
+                      <div className="rounded-lg border border-slate-800 bg-slate-950/70 px-3 py-2">
+                        <p className="text-[11px] text-slate-400 mb-1">Chain of Control</p>
+                        <p className="text-[11px] text-slate-300">
+                          Created: {entry.approval_timeline?.created_by ? `Admin-${entry.approval_timeline.created_by}` : "-"} @ {formatDateTime(entry.approval_timeline?.timestamps?.created_at)}
+                        </p>
+                        <p className="text-[11px] text-slate-300">
+                          Exported: {entry.approval_timeline?.exported_by ? `Admin-${entry.approval_timeline.exported_by}` : "-"} @ {formatDateTime(entry.approval_timeline?.timestamps?.exported_at)}
+                        </p>
+                        <p className="text-[11px] text-slate-300">
+                          Verified: {entry.approval_timeline?.verified_by ? `Admin-${entry.approval_timeline.verified_by}` : "-"} @ {formatDateTime(entry.approval_timeline?.timestamps?.verified_at)}
+                        </p>
+                        <p className="text-[11px] text-slate-300">
+                          2nd Approval: {entry.approval_timeline?.approved_by_2 ? `Admin-${entry.approval_timeline.approved_by_2}` : "-"} @ {formatDateTime(entry.approval_timeline?.timestamps?.approved_at)}
+                        </p>
+                      </div>
                     </div>
-                  </div>
-                  <div className="text-right">
-                    <span
-                      className={`inline-flex items-center rounded-full border px-2.5 py-1 text-[11px] font-semibold ${
-                        entry.is_filed
-                          ? "border-emerald-500/40 bg-emerald-500/15 text-emerald-200"
-                          : "border-amber-500/40 bg-amber-500/15 text-amber-200"
-                      }`}
-                    >
-                      {entry.is_filed ? "FILED" : "PENDING_REVIEW"}
-                    </span>
-                    {entry.waiting_second_admin ? (
-                      <p className="text-[11px] text-amber-300 mt-1">Waiting for 2nd Admin</p>
-                    ) : null}
-                    {entry.filed_at ? <p className="text-xs text-slate-500 mt-1">Filed: {formatDateTime(entry.filed_at)}</p> : null}
-                  </div>
-                </div>
-              ))
+                    <div className="text-right">
+                      <span
+                        className={`inline-flex items-center rounded-full border px-2.5 py-1 text-[11px] font-semibold ${
+                          entry.is_filed
+                            ? "border-emerald-500/40 bg-emerald-500/15 text-emerald-200"
+                            : "border-amber-500/40 bg-amber-500/15 text-amber-200"
+                        }`}
+                      >
+                        {entry.is_filed ? "FILED" : "PENDING_REVIEW"}
+                      </span>
+                      {entry.waiting_second_admin ? (
+                        <p className="text-[11px] text-amber-300 mt-1">Waiting for 2nd Admin</p>
+                      ) : null}
+                      {entry.filed_at ? <p className="text-xs text-slate-500 mt-1">Filed: {formatDateTime(entry.filed_at)}</p> : null}
+                    </div>
+                  </motion.div>
+                ))}
+              </AnimatePresence>
             )}
           </div>
+        </section>
+
+        <section className="rounded-2xl border border-white/20 bg-black/65 p-5 space-y-3 glass-panel ai-panel ai-reveal" data-delay="3">
+          <div className="flex items-center justify-between gap-3">
+            <h3 className="text-lg font-semibold">Forensic Audit Dashboard</h3>
+            <button
+              onClick={fetchForensicAudit}
+              disabled={isForensicLoading}
+              className="inline-flex items-center justify-center gap-2 px-4 py-2 rounded-lg border border-cyan-700/70 bg-cyan-900/40 hover:bg-cyan-800/50 text-sm font-semibold disabled:opacity-60"
+            >
+              {isForensicLoading ? "Scanning..." : "Refresh Audit"}
+            </button>
+          </div>
+          {forensicError ? <p className="text-sm text-red-300">{forensicError}</p> : null}
+          {forensicAudit ? (
+            <div className="space-y-2">
+              <p className="text-sm text-slate-300">
+                Model: <span className="text-cyan-300 mono-metrics">{forensicAudit.model}</span> | Risk Score: <span className="text-amber-300 mono-metrics">{forensicAudit.risk_score}</span>
+              </p>
+              <p className="text-xs text-slate-400">{forensicAudit.summary}</p>
+              <div className="space-y-2 max-h-52 overflow-y-auto">
+                {(forensicAudit.flagged_entries || []).slice(0, 8).map((item, idx) => (
+                  <div key={`forensic-${item.entry_id || idx}`} className="rounded-lg border border-slate-700 bg-slate-950/70 px-3 py-2">
+                    <p className="text-xs text-amber-200">Entry #{item.entry_id || "-"} | {item.severity || "MEDIUM"}</p>
+                    <p className="text-[11px] text-slate-300">{item.issue || "No issue details provided."}</p>
+                  </div>
+                ))}
+              </div>
+            </div>
+          ) : (
+            <p className="text-sm text-slate-400">No forensic snapshot yet. Run refresh to scan the latest ledger entries.</p>
+          )}
         </section>
 
         <section className="rounded-2xl border border-slate-800 bg-slate-900/60 p-5 space-y-3 ai-panel ai-reveal" data-delay="3">

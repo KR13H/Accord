@@ -1,1 +1,44 @@
+@import url("https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;600;700&family=JetBrains+Mono:wght@400;600&display=swap");
 @import "tailwindcss";
+
+:root {
+	--bg-deep: #000000;
+	--bg-grid: #020617;
+	--text-stark: #ffffff;
+	--text-muted: #9ca3af;
+	--neon-cyan: #22d3ee;
+	--neon-emerald: #10b981;
+	--neon-amber: #f59e0b;
+	--glass-bg: rgba(15, 23, 42, 0.66);
+}
+
+html,
+body,
+#root {
+	min-height: 100%;
+}
+
+body {
+	margin: 0;
+	color: var(--text-stark);
+	font-family: "Space Grotesk", "Segoe UI", sans-serif;
+	background:
+		radial-gradient(circle at 12% 18%, rgba(34, 211, 238, 0.15) 0%, rgba(34, 211, 238, 0) 32%),
+		radial-gradient(circle at 88% 14%, rgba(16, 185, 129, 0.13) 0%, rgba(16, 185, 129, 0) 28%),
+		linear-gradient(145deg, var(--bg-deep) 0%, var(--bg-grid) 100%);
+	background-attachment: fixed;
+	-webkit-font-smoothing: antialiased;
+	text-rendering: optimizeLegibility;
+}
+
+.glass-panel {
+	background: var(--glass-bg);
+	backdrop-filter: blur(14px);
+	-webkit-backdrop-filter: blur(14px);
+	border: 1px solid rgba(255, 255, 255, 0.1);
+	box-shadow: 0 8px 32px rgba(0, 0, 0, 0.72);
+}
+
+.mono-metrics {
+	font-family: "JetBrains Mono", ui-monospace, monospace;
+}
