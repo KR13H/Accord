@@ -1,0 +1,58 @@
+# Dependencies
+node_modules/
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+
+# Build outputs
+dist/
+build/
+*.egg
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Environment variables
+.env
+.env.local
+.env.*.local
+
+# Logs
+*.log
+npm-debug.log*
+yarn-debug.log*
+
+# Temporary files
+.cache/
+tmp/
+temp/
+
+# iOS build
+ios/
+Pods/
+
+# Storage (keep directory structure, ignore contents)
+storage/receipts/*
+storage/tally_exports/*
+storage/audit_vault/*
+!storage/receipts/.gitkeep
+!storage/tally_exports/.gitkeep
+!storage/audit_vault/.gitkeep
+
+# RAM disk cache
+/Volumes/AccordCache/
+
+# Test coverage
+.coverage
+htmlcov/
+.pytest_cache/

@@ -1,0 +1,11 @@
+fastapi
+uvicorn[standard]
+sqlalchemy
+pydantic
+reportlab
+httpx
+python-multipart
+psycopg[binary]
+pytesseract
+Pillow
+opencv-python

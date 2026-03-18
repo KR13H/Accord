@@ -1,0 +1,47 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: accord-postgres
+    environment:
+      POSTGRES_DB: accord
+      POSTGRES_USER: accord
+      POSTGRES_PASSWORD: accord
+    ports:
+      - "5432:5432"
+    volumes:
+      - accord_pg_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U accord -d accord"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  backend:
+    build:
+      context: ./cloud-backend
+    container_name: accord-backend
+    environment:
+      GSTN_ECL_BASE_URL: ""
+      GSTN_ECL_TOKEN: ""
+      ACCORD_BIOMETRIC_SECRET: "change-this-in-production"
+      # Runtime is currently sqlite3; keep postgres service warm for migration cutover.
+      DATABASE_URL: sqlite:////app/ledger.db
+    depends_on:
+      postgres:
+        condition: service_healthy
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./cloud-backend:/app
+
+  frontend:
+    build:
+      context: ./friday-insights
+    container_name: accord-frontend
+    depends_on:
+      - backend
+    ports:
+      - "3000:80"
+
+volumes:
+  accord_pg_data:
