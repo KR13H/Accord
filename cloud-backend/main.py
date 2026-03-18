@@ -1354,7 +1354,8 @@ def generate_tally_export(conn: sqlite3.Connection, entry_id: int) -> tuple[byte
         ET.SubElement(ledger_entry, "AMOUNT").text = f"{amount:.4f}"
 
     xml_bytes = ET.tostring(envelope, encoding="utf-8", xml_declaration=True)
-    filename = f"Accord_Tally_Export_{entry['reference']}.xml"
+    safe_reference = re.sub(r"[^A-Za-z0-9._-]+", "-", str(entry["reference"]))
+    filename = f"Accord_Tally_Export_{safe_reference}.xml"
     TALLY_EXPORT_DIR.mkdir(parents=True, exist_ok=True)
     export_path = TALLY_EXPORT_DIR / filename
     export_path.write_bytes(xml_bytes)
