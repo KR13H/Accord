@@ -98,14 +98,16 @@ function ComplianceGauge({ score }) {
   );
 }
 
-function M3CoreMonitor({ pulse, activeWorkers, mistralReady }) {
-  const workerLoad = Math.min(100, 28 + activeWorkers * 7 + (pulse % 18));
-  const efficiencyLoad = Math.min(100, 24 + Math.floor(workerLoad * 0.82));
-  const neuralLoad = Math.min(100, 34 + Math.floor(workerLoad * 0.9));
+function M3CoreMonitor({ telemetry, neuralActive, mistralReady }) {
+  const cpuLoad = Math.max(2, Math.min(100, Number(telemetry?.cpu_percent || 0)));
+  const workerLoad = Math.max(2, Math.min(100, (Number(telemetry?.active_workers || 0) / 10) * 100));
+  const ramLoad = telemetry?.ram_total_gb
+    ? Math.max(2, Math.min(100, (Number(telemetry.ram_used_gb || 0) / Number(telemetry.ram_total_gb)) * 100))
+    : 2;
   const signals = [
-    { key: "perf", label: "Performance Cores", value: workerLoad, tone: "bg-cyan-300" },
-    { key: "eff", label: "Efficiency Cores", value: efficiencyLoad, tone: "bg-emerald-300" },
-    { key: "neural", label: "Neural Engine", value: neuralLoad, tone: "bg-amber-300" },
+    { key: "cpu", label: "CPU Saturation", value: cpuLoad, tone: "bg-white shadow-[0_0_16px_rgba(255,255,255,0.85)]" },
+    { key: "workers", label: "Worker Pool", value: workerLoad, tone: "bg-slate-200" },
+    { key: "ram", label: "RAM Load", value: ramLoad, tone: "bg-emerald-300" },
   ];
 
   return (
@@ -133,7 +135,12 @@ function M3CoreMonitor({ pulse, activeWorkers, mistralReady }) {
           </div>
         ))}
       </div>
-      <p className="mt-3 text-[11px] text-slate-400">Active workers: {activeWorkers} / 10</p>
+      <div className="mt-3 flex items-center justify-between text-[11px] text-slate-400">
+        <span>Workers: {telemetry?.active_workers ?? 0} / {telemetry?.max_workers ?? 10}</span>
+        <span className={neuralActive ? "text-cyan-300 drop-shadow-[0_0_10px_rgba(34,211,238,0.9)]" : "text-slate-500"}>
+          Neural Engine {neuralActive ? "ACTIVE" : "IDLE"}
+        </span>
+      </div>
     </div>
   );
 }
@@ -187,7 +194,8 @@ export default function AiInsights() {
   const [forensicError, setForensicError] = useState("");
   const [isForensicLoading, setIsForensicLoading] = useState(false);
   const [mistralReady, setMistralReady] = useState(false);
-  const [corePulse, setCorePulse] = useState(0);
+  const [telemetry, setTelemetry] = useState(null);
+  const [forensicStreamText, setForensicStreamText] = useState("");
 
   useEffect(() => {
     if (!fridayAnswer) {
@@ -207,11 +215,34 @@ export default function AiInsights() {
   }, [fridayAnswer]);
 
   useEffect(() => {
+    if (!forensicAudit?.audit_report) {
+      setForensicStreamText("");
+      return;
+    }
+    setForensicStreamText("");
+    let cursor = 0;
+    const source = String(forensicAudit.audit_report);
     const timer = setInterval(() => {
-      setCorePulse((value) => (value + 7) % 1000);
-    }, 900);
+      cursor += 8;
+      setForensicStreamText(source.slice(0, cursor));
+      if (cursor >= source.length) {
+        clearInterval(timer);
+      }
+    }, 18);
     return () => clearInterval(timer);
-  }, []);
+  }, [forensicAudit]);
+
+  const fetchTelemetry = async () => {
+    try {
+      const res = await fetch("/api/v1/system/m3-telemetry");
+      const data = await res.json();
+      if (res.ok) {
+        setTelemetry(data);
+      }
+    } catch {
+      // keep last known telemetry snapshot
+    }
+  };
 
   const refreshModelHealth = async () => {
     try {
@@ -226,8 +257,10 @@ export default function AiInsights() {
   const fetchForensicAudit = async () => {
     setIsForensicLoading(true);
     setForensicError("");
+    setForensicStreamText("");
     try {
       const res = await fetch("/api/v1/insights/forensic-audit?limit=250", {
+        method: "POST",
         headers: {
           "X-Role": adminRole,
           "X-Admin-Id": adminId,
@@ -401,6 +434,11 @@ export default function AiInsights() {
   useEffect(() => {
     void refreshModelHealth();
     void fetchForensicAudit();
+    void fetchTelemetry();
+    const timer = setInterval(() => {
+      void fetchTelemetry();
+    }, 2000);
+    return () => clearInterval(timer);
   }, [adminRole, adminId]);
 
   const runReversalWizard = async () => {
@@ -872,7 +910,8 @@ export default function AiInsights() {
     ? 10
     : isUploadingReceipt || isNeuralInking
       ? 4
-      : Math.min(6, Number(forensicAudit?.flagged_entries?.length || 0));
+      : Number(telemetry?.active_workers || 0);
+  const neuralEngineActive = Boolean(telemetry?.neural_engine_active) || isBatchUploading || isNeuralInking;
 
   const radarSignals = [
     {
@@ -1109,7 +1148,7 @@ export default function AiInsights() {
                 {formatINR(summary?.summary?.total_potential_interest_savings)}
               </p>
             </div>
-            <M3CoreMonitor pulse={corePulse} activeWorkers={activeWorkers} mistralReady={mistralReady} />
+            <M3CoreMonitor telemetry={telemetry} neuralActive={neuralEngineActive} mistralReady={mistralReady} />
           </div>
         </header>
 
@@ -1375,7 +1414,7 @@ export default function AiInsights() {
               disabled={isForensicLoading}
               className="inline-flex items-center justify-center gap-2 px-4 py-2 rounded-lg border border-cyan-700/70 bg-cyan-900/40 hover:bg-cyan-800/50 text-sm font-semibold disabled:opacity-60"
             >
-              {isForensicLoading ? "Scanning..." : "Refresh Audit"}
+              {isForensicLoading ? "Scanning..." : "Audit Trigger"}
             </button>
           </div>
           {forensicError ? <p className="text-sm text-red-300">{forensicError}</p> : null}
@@ -1384,8 +1423,11 @@ export default function AiInsights() {
               <p className="text-sm text-slate-300">
                 Model: <span className="text-cyan-300 mono-metrics">{forensicAudit.model}</span> | Risk Score: <span className="text-amber-300 mono-metrics">{forensicAudit.risk_score}</span>
               </p>
-              <p className="text-xs text-slate-400">{forensicAudit.summary}</p>
-              <div className="space-y-2 max-h-52 overflow-y-auto">
+              <p className="text-xs text-slate-400">Fingerprint: <span className="mono-metrics text-emerald-300">{forensicAudit.report_fingerprint}</span></p>
+              <pre className="rounded-xl border border-cyan-900/60 bg-black/85 p-3 text-[11px] leading-relaxed text-slate-100 font-mono max-h-56 overflow-auto">
+{forensicError ? `ERROR> ${forensicError}` : forensicStreamText || "READY> Awaiting forensic trigger..."}
+              </pre>
+              <div className="space-y-2 max-h-44 overflow-y-auto">
                 {(forensicAudit.flagged_entries || []).slice(0, 8).map((item, idx) => (
                   <div key={`forensic-${item.entry_id || idx}`} className="rounded-lg border border-slate-700 bg-slate-950/70 px-3 py-2">
                     <p className="text-xs text-amber-200">Entry #{item.entry_id || "-"} | {item.severity || "MEDIUM"}</p>

@@ -7,6 +7,7 @@ import io
 import hmac
 import os
 import secrets
+import shutil
 import uuid
 from contextlib import closing
 from datetime import date, datetime, timedelta
@@ -96,6 +97,11 @@ try:
     from PIL import Image
 except Exception:  # noqa: BLE001
     Image = None
+
+try:
+    import psutil  # type: ignore
+except Exception:  # noqa: BLE001
+    psutil = None
 
 # Keep UQC values constrained to GSTN-style codes; alias map handles common user inputs.
 ALLOWED_UQC = {
@@ -2068,6 +2074,45 @@ async def get_friday_health(model: str = "llama3.2") -> dict[str, Any]:
         }
 
 
+@app.get("/api/v1/system/m3-telemetry")
+async def get_m3_telemetry() -> dict[str, Any]:
+    cpu_percent = 0.0
+    ram_used_gb = 0.0
+    ram_total_gb = 0.0
+    cache_disk_free_mb = 0
+    active_workers = 0
+
+    if psutil is not None:
+        try:
+            cpu_percent = float(psutil.cpu_percent(interval=None))
+            vm = psutil.virtual_memory()
+            ram_used_gb = round(vm.used / (1024**3), 2)
+            ram_total_gb = round(vm.total / (1024**3), 2)
+            active_workers = min(MAX_PARALLEL_WORKERS, len(psutil.Process().children(recursive=True)))
+        except Exception:  # noqa: BLE001
+            pass
+
+    try:
+        if RAM_DISK_BUFFER.exists():
+            usage = shutil.disk_usage(str(RAM_DISK_BUFFER.parent))
+            cache_disk_free_mb = int(usage.free // (1024**2))
+    except Exception:  # noqa: BLE001
+        cache_disk_free_mb = 0
+
+    return {
+        "status": "ok",
+        "cpu_percent": round(cpu_percent, 2),
+        "ram_used_gb": ram_used_gb,
+        "ram_total_gb": ram_total_gb,
+        "neural_engine_active": active_workers > 0,
+        "active_workers": active_workers,
+        "max_workers": MAX_PARALLEL_WORKERS,
+        "cache_disk_free_mb": cache_disk_free_mb,
+        "cache_disk_mounted": RAM_DISK_BUFFER.exists(),
+        "timestamp": datetime.utcnow().isoformat(timespec="seconds") + "Z",
+    }
+
+
 @app.post("/api/v1/ledger/upload-photo")
 async def upload_photo_to_ledger(
     file: UploadFile = File(...),
@@ -2788,6 +2833,8 @@ def export_tally_bulk(
             filename = f"Accord_Tally_Bulk_Export_{export_ts}_{len(entries)}_entries.xml"
             export_path = TALLY_EXPORT_DIR / filename
             export_path.write_bytes(xml_bytes)
+            master_path = TALLY_EXPORT_DIR / "MASTER_VOUCHER.xml"
+            master_path.write_bytes(xml_bytes)
 
             # Log audit
             log_audit(
@@ -2804,6 +2851,7 @@ def export_tally_bulk(
                     "balanced": is_balanced,
                     "integrity_check": integrity_hash,
                     "export_file": str(export_path),
+                    "master_export_file": str(master_path),
                     "actor_role": role,
                 },
                 user_id=admin_id,
@@ -2823,6 +2871,7 @@ def export_tally_bulk(
         headers={
             "Content-Disposition": f"attachment; filename={filename}",
             "X-Accord-Export-Path": str(export_path),
+            "X-Accord-Master-Export-Path": str(master_path),
             "X-Batch-ID": batch_id,
             "X-Batch-Entries": str(len(entries)),
             "X-Batch-Balanced": "true" if is_balanced else "false",
@@ -4278,7 +4327,7 @@ async def post_ask_friday(payload: AskFridayIn) -> dict[str, Any]:
     }
 
 
-@app.get("/api/v1/insights/forensic-audit")
+@app.api_route("/api/v1/insights/forensic-audit", methods=["GET", "POST"])
 async def get_forensic_audit(
     limit: int = 200,
     x_role: str | None = Header(default=None, alias="X-Role"),
@@ -4337,6 +4386,19 @@ async def get_forensic_audit(
 
     parsed = parse_structured_json(audit_raw)
     flagged_entries = parsed.get("flagged_entries") if isinstance(parsed.get("flagged_entries"), list) else []
+    summary_text = str(parsed.get("summary", "No summary returned."))
+    report_blocks = [
+        f"MODEL: {model_used}",
+        f"ENTRIES_SCANNED: {len(dataset)}",
+        f"RISK_SCORE: {parsed.get('risk_score', 0)}",
+        f"SUMMARY: {summary_text}",
+    ]
+    for flagged in flagged_entries[:50]:
+        report_blocks.append(
+            f"ENTRY #{flagged.get('entry_id', '-')}: {flagged.get('severity', 'MEDIUM')} | {flagged.get('issue', 'No issue details provided.')}"
+        )
+    report_text = "\n".join(report_blocks)
+    report_fingerprint = sha256(report_text.encode("utf-8")).hexdigest()
 
     with closing(get_conn()) as conn:
         conn.execute("BEGIN")
@@ -4350,6 +4412,7 @@ async def get_forensic_audit(
                 "entries_scanned": len(dataset),
                 "flagged_count": len(flagged_entries),
                 "model": model_used,
+                "report_fingerprint": report_fingerprint,
                 "actor_role": role,
             },
             user_id=admin_id,
@@ -4362,8 +4425,11 @@ async def get_forensic_audit(
         "model": model_used,
         "entries_scanned": len(dataset),
         "risk_score": parsed.get("risk_score", 0),
-        "summary": parsed.get("summary", "No summary returned."),
+        "summary": summary_text,
         "flagged_entries": flagged_entries,
+        "audit_report": report_text,
+        "report_fingerprint": report_fingerprint,
+        "timestamp": datetime.utcnow().isoformat(timespec="seconds") + "Z",
     }
 
 
