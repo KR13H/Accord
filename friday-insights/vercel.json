@@ -1,0 +1,15 @@
+{
+  "routes": [
+    {
+      "src": "/api/(.*)",
+      "dest": "https://accord-logic.onrender.com/api/$1"
+    },
+    {
+      "handle": "filesystem"
+    },
+    {
+      "src": "/(.*)",
+      "dest": "/index.html"
+    }
+  ]
+}

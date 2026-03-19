@@ -109,6 +109,20 @@ NEXUS_GRAPH_DIR = STORAGE_ROOT / "nexus_graphs"
 RAM_DISK_BUFFER = Path("/Volumes/AccordCache/receipt_buffer")
 MAX_PARALLEL_WORKERS = 16  # M3 adaptive upper bound for mixed I/O + OCR workloads
 
+CORS_DEFAULT_ORIGINS = [
+    "http://localhost:5173",
+    "http://127.0.0.1:5173",
+    "http://localhost:3000",
+    "http://127.0.0.1:3000",
+]
+
+
+def resolve_cors_allow_origins() -> list[str]:
+    raw = os.getenv("CORS_ALLOW_ORIGINS", "").strip()
+    if not raw:
+        return CORS_DEFAULT_ORIGINS
+    return [origin.strip() for origin in raw.split(",") if origin.strip()]
+
 try:
     import cv2  # type: ignore
 except Exception:  # noqa: BLE001
@@ -1550,6 +1564,10 @@ compliance_service: ComplianceService | None = None
 inventory_service: InventoryService | None = None
 voucher_service = VoucherService()
 
+cors_allow_origins = resolve_cors_allow_origins()
+cors_allow_origin_regex = os.getenv("CORS_ALLOW_ORIGIN_REGEX", "").strip() or None
+cors_allow_credentials = "*" not in cors_allow_origins
+
 
 def ensure_service_layer() -> tuple[AccountingService, IngestService, ComplianceService, InventoryService]:
     """Builds the service layer on first use after helper functions are available.
@@ -1601,8 +1619,9 @@ def ensure_service_layer() -> tuple[AccountingService, IngestService, Compliance
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
+    allow_origins=cors_allow_origins,
+    allow_origin_regex=cors_allow_origin_regex,
+    allow_credentials=cors_allow_credentials,
     allow_methods=["*"],
     allow_headers=["*"],
 )

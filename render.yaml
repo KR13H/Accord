@@ -1,0 +1,19 @@
+services:
+  - type: web
+    name: accord-backend
+    runtime: python
+    rootDir: cloud-backend
+    plan: free
+    autoDeploy: true
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn main:app --host 0.0.0.0 --port $PORT
+    healthCheckPath: /api/v1/health
+    envVars:
+      - key: DATABASE_URL
+        sync: false
+      - key: CORS_ALLOW_ORIGINS
+        value: https://accord-stark.vercel.app,http://localhost:5173,http://127.0.0.1:5173
+      - key: CORS_ALLOW_ORIGIN_REGEX
+        value: ^https://.*\.vercel\.app$
+      - key: ACCORD_BIOMETRIC_SECRET
+        generateValue: true
