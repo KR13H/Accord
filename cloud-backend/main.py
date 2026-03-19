@@ -5,6 +5,7 @@ import base64
 import csv
 import io
 import hmac
+import smtplib
 import os
 import secrets
 import shutil
@@ -19,6 +20,7 @@ import re
 from typing import Any, List
 import xml.etree.ElementTree as ET
 from concurrent.futures import ProcessPoolExecutor
+from email.message import EmailMessage
 
 from fastapi import FastAPI, File, Header, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
@@ -76,10 +78,19 @@ OLLAMA_GENERATE_URL = f"{OLLAMA_HOST}/api/generate"
 VISION_MODEL = os.getenv("ACCORD_VISION_MODEL", "llava")
 RECON_MODEL = os.getenv("ACCORD_RECON_MODEL", "llama3.2")
 FORENSIC_MODEL = os.getenv("ACCORD_FORENSIC_MODEL", "mistral")
+SMTP_HOST = os.getenv("ACCORD_SMTP_HOST", "")
+SMTP_PORT = int(os.getenv("ACCORD_SMTP_PORT", "587"))
+SMTP_USERNAME = os.getenv("ACCORD_SMTP_USERNAME", "")
+SMTP_PASSWORD = os.getenv("ACCORD_SMTP_PASSWORD", "")
+SMTP_FROM_EMAIL = os.getenv("ACCORD_SMTP_FROM", SMTP_USERNAME or "no-reply@accord.local")
+SMTP_USE_TLS = os.getenv("ACCORD_SMTP_USE_TLS", "true").strip().lower() in {"1", "true", "yes"}
 
 STORAGE_ROOT = Path(__file__).resolve().parents[1] / "storage"
 RECEIPT_STORAGE_DIR = STORAGE_ROOT / "receipts"
 TALLY_EXPORT_DIR = STORAGE_ROOT / "tally_exports"
+OMNI_INGEST_DIR = STORAGE_ROOT / "omni_ingest"
+PROCESSED_ARCHIVE_DIR = STORAGE_ROOT / "processed_archives"
+NEXUS_GRAPH_DIR = STORAGE_ROOT / "nexus_graphs"
 RAM_DISK_BUFFER = Path("/Volumes/AccordCache/receipt_buffer")
 MAX_PARALLEL_WORKERS = 10  # M3 8-core: 4 perf + 4 efficiency = 10 workers for IO balance
 
@@ -87,6 +98,26 @@ try:
     import cv2  # type: ignore
 except Exception:  # noqa: BLE001
     cv2 = None
+
+try:
+    import pandas as pd  # type: ignore
+except Exception:  # noqa: BLE001
+    pd = None
+
+try:
+    import fitz  # type: ignore
+except Exception:  # noqa: BLE001
+    fitz = None
+
+try:
+    import networkx as nx  # type: ignore
+except Exception:  # noqa: BLE001
+    nx = None
+
+try:
+    import whisper as whisper_lib  # type: ignore
+except Exception:  # noqa: BLE001
+    whisper_lib = None
 
 try:
     import pytesseract  # type: ignore
@@ -102,6 +133,8 @@ try:
     import psutil  # type: ignore
 except Exception:  # noqa: BLE001
     psutil = None
+
+WHISPER_MODEL_CACHE: Any | None = None
 
 # Keep UQC values constrained to GSTN-style codes; alias map handles common user inputs.
 ALLOWED_UQC = {
@@ -531,6 +564,710 @@ async def extract_receipt_fields(image_path: Path, ocr_text: str) -> tuple[dict[
         return {}, ""
 
 
+def _pick_value(payload: dict[str, Any], keys: list[str]) -> str:
+    lowered = {str(k).strip().lower(): v for k, v in payload.items()}
+    for key in keys:
+        if key in lowered and lowered[key] not in (None, ""):
+            return str(lowered[key]).strip()
+    return ""
+
+
+def _extract_excel_rows(file_path: Path) -> list[dict[str, Any]]:
+    ext = file_path.suffix.lower()
+    if ext == ".csv":
+        with file_path.open("r", encoding="utf-8", newline="") as handle:
+            return [dict(row) for row in csv.DictReader(handle)]
+
+    if pd is None:
+        raise HTTPException(status_code=503, detail="pandas/openpyxl not installed for Excel ingestion")
+
+    dataframe = pd.read_excel(file_path)
+    dataframe = dataframe.fillna("")
+    return dataframe.to_dict(orient="records")
+
+
+def _row_to_ledger_fields(row: dict[str, Any]) -> dict[str, Any]:
+    date_value = _pick_value(row, ["date", "invoice_date", "voucher_date", "bill_date"])
+    vendor = _pick_value(row, ["vendor", "supplier", "party", "name", "counterparty"])
+    gstin = _pick_value(row, ["gstin", "vendor_gstin", "supplier_gstin", "counterparty_gstin"]).upper()
+    hsn = _pick_value(row, ["hsn", "hsn_code", "item_hsn"])
+    amount = _pick_value(row, ["total_amount", "amount", "total", "gross_amount", "net_amount", "invoice_amount"])
+    narration = _pick_value(row, ["description", "narration", "remarks", "note"])
+
+    return {
+        "date": date_value,
+        "vendor": vendor,
+        "gstin": gstin,
+        "hsn": hsn,
+        "total_amount": amount,
+        "confidence": "excel-structured",
+        "notes": narration,
+    }
+
+
+async def _extract_from_text_blob(raw_text: str, source: str) -> tuple[dict[str, Any], str]:
+    if not raw_text.strip():
+        return {}, ""
+
+    prompt = (
+        "You are an accounting extractor. Return ONLY strict JSON with keys: "
+        "date, vendor, gstin, total_amount, hsn, confidence, notes. "
+        "Use empty string when unknown and keep total_amount numeric when possible. "
+        f"Source type: {source}. Input text:\n{raw_text[:12000]}"
+    )
+    try:
+        raw = await run_ollama_generate(model=RECON_MODEL, prompt=prompt)
+        return parse_structured_json(raw), raw
+    except Exception:  # noqa: BLE001
+        return {}, ""
+
+
+async def _extract_from_pdf(pdf_path: Path) -> tuple[dict[str, Any], str, str]:
+    if fitz is None:
+        raise HTTPException(status_code=503, detail="pymupdf is not installed for PDF ingestion")
+
+    text_segments: list[str] = []
+    llava_responses: list[str] = []
+    best_extracted: dict[str, Any] = {}
+    best_score = Decimal("0")
+
+    doc = fitz.open(pdf_path)
+    try:
+        for page in doc:
+            text_segments.append(page.get_text("text") or "")
+    finally:
+        doc.close()
+
+    merged_text = "\n".join(text_segments).strip()
+    if merged_text:
+        extracted, raw = await _extract_from_text_blob(merged_text, "pdf")
+        if extracted:
+            return extracted, raw, merged_text
+
+    doc = fitz.open(pdf_path)
+    try:
+        pages = min(3, len(doc))
+        RAM_DISK_BUFFER.mkdir(parents=True, exist_ok=True)
+        for idx in range(pages):
+            page = doc[idx]
+            pix = page.get_pixmap(matrix=fitz.Matrix(2, 2))
+            rendered = RAM_DISK_BUFFER / f"pdf_page_{uuid.uuid4().hex}_{idx}.jpg"
+            pix.save(str(rendered))
+            try:
+                ocr_text = extract_text_with_tesseract(rendered)
+                extracted, model_response = await extract_receipt_fields(rendered, ocr_text)
+                if model_response:
+                    llava_responses.append(model_response)
+                score = parse_amount_from_text(str(extracted.get("total_amount", "0")))
+                if score > best_score:
+                    best_extracted = extracted
+                    best_score = score
+            finally:
+                rendered.unlink(missing_ok=True)
+    finally:
+        doc.close()
+
+    return best_extracted, "\n\n".join(llava_responses), merged_text
+
+
+async def _extract_from_video(video_path: Path) -> tuple[dict[str, Any], str, str]:
+    if cv2 is None:
+        raise HTTPException(status_code=503, detail="opencv-python is not installed for video ingestion")
+
+    capture = cv2.VideoCapture(str(video_path))
+    if not capture.isOpened():
+        raise HTTPException(status_code=422, detail="Unable to open uploaded video")
+
+    frame_count = int(capture.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
+    sample_total = 5
+    picks: list[int] = []
+    if frame_count > 0:
+        for i in range(sample_total):
+            picks.append(min(frame_count - 1, int((i / max(sample_total - 1, 1)) * (frame_count - 1))))
+    else:
+        picks = [0, 10, 20, 30, 40]
+
+    best_extracted: dict[str, Any] = {}
+    best_score = Decimal("0")
+    all_ocr: list[str] = []
+    all_responses: list[str] = []
+    RAM_DISK_BUFFER.mkdir(parents=True, exist_ok=True)
+
+    try:
+        for idx, frame_no in enumerate(picks):
+            capture.set(cv2.CAP_PROP_POS_FRAMES, frame_no)
+            ok, frame = capture.read()
+            if not ok or frame is None:
+                continue
+
+            frame_path = RAM_DISK_BUFFER / f"video_frame_{uuid.uuid4().hex}_{idx}.jpg"
+            if not cv2.imwrite(str(frame_path), frame):
+                continue
+
+            try:
+                ocr_text = extract_text_with_tesseract(frame_path)
+                if ocr_text:
+                    all_ocr.append(ocr_text)
+                extracted, model_response = await extract_receipt_fields(frame_path, ocr_text)
+                if model_response:
+                    all_responses.append(model_response)
+                score = parse_amount_from_text(str(extracted.get("total_amount", "0")))
+                if score > best_score:
+                    best_extracted = extracted
+                    best_score = score
+            finally:
+                frame_path.unlink(missing_ok=True)
+    finally:
+        capture.release()
+
+    return best_extracted, "\n\n".join(all_responses), "\n".join(all_ocr)
+
+
+def _post_ledger_entry_from_extract(
+    *,
+    conn: sqlite3.Connection,
+    extracted: dict[str, Any],
+    fallback_text: str,
+    description_prefix: str,
+    actor_role: str,
+    admin_id: int,
+    source_file_path: Path,
+    model_response: str,
+    import_status: str,
+) -> dict[str, Any]:
+    imported_date = parse_date_from_text(str(extracted.get("date", "")))
+    vendor_name = str(extracted.get("vendor", "")).strip() or "Omni Vendor"
+    gstin = str(extracted.get("gstin", "")).strip().upper()
+    hsn = str(extracted.get("hsn", "")).strip()
+    amount = parse_amount_from_text(str(extracted.get("total_amount", "0")))
+    if amount <= 0:
+        amount = parse_amount_from_text(fallback_text)
+    if amount <= 0:
+        raise HTTPException(status_code=422, detail="Unable to detect a valid amount from ingested file")
+
+    check_period_lock(conn, imported_date)
+    reference = next_journal_reference(conn, imported_date)
+    purchases_id = get_account_id_by_name(conn, "Purchases")
+    payable_id = get_account_id_by_name(conn, "Accounts Payable")
+    created_at = datetime.utcnow().isoformat(timespec="seconds") + "Z"
+
+    conn.execute(
+        """
+        INSERT INTO journal_entries(
+            date,
+            reference,
+            description,
+            company_state_code,
+            counterparty_state_code,
+            counterparty_gstin,
+            eco_gstin,
+            supply_source,
+            ims_status,
+            vendor_legal_name,
+            vendor_gstr1_filed_at,
+            status,
+            reversal_of_id,
+            is_filed,
+            filed_at,
+            filed_export_hash,
+            approved_by_1,
+            approved_by_2,
+            created_at
+        ) VALUES (?, ?, ?, NULL, NULL, ?, NULL, 'DIRECT', 'PENDING', ?, NULL, 'POSTED', NULL, 0, NULL, NULL, NULL, NULL, ?)
+        """,
+        (
+            imported_date.isoformat(),
+            reference,
+            f"{description_prefix}: {vendor_name}",
+            gstin or None,
+            vendor_name,
+            created_at,
+        ),
+    )
+    entry_id = int(conn.execute("SELECT last_insert_rowid() AS id").fetchone()["id"])
+
+    conn.execute(
+        "INSERT INTO journal_lines(entry_id, account_id, debit, credit) VALUES (?, ?, ?, ?)",
+        (entry_id, purchases_id, money_str(amount), money_str(Decimal("0"))),
+    )
+    update_account_balance(conn, purchases_id, amount, Decimal("0"))
+
+    conn.execute(
+        "INSERT INTO journal_lines(entry_id, account_id, debit, credit) VALUES (?, ?, ?, ?)",
+        (entry_id, payable_id, money_str(Decimal("0")), money_str(amount)),
+    )
+    update_account_balance(conn, payable_id, Decimal("0"), amount)
+    fingerprint = stamp_entry_fingerprint(conn, entry_id)
+
+    conn.execute(
+        """
+        INSERT INTO receipt_imports(entry_id, file_path, ocr_text, extracted_json, model_response, status, created_by, created_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            entry_id,
+            str(source_file_path),
+            fallback_text or None,
+            json.dumps(extracted) if extracted else None,
+            model_response or None,
+            import_status,
+            admin_id,
+            created_at,
+        ),
+    )
+
+    _, filename, export_path, _, _ = generate_tally_export(conn, entry_id)
+    log_audit(
+        conn,
+        table_name="journal_entries",
+        record_id=entry_id,
+        action="OMNI_READER_IMPORT",
+        old_value=None,
+        new_value={
+            "reference": reference,
+            "vendor": vendor_name,
+            "gstin": gstin,
+            "hsn": hsn,
+            "amount": money_str(amount),
+            "entry_fingerprint": fingerprint,
+            "source_file": str(source_file_path),
+            "tally_export": str(export_path),
+            "actor_role": actor_role,
+            "import_status": import_status,
+        },
+        user_id=admin_id,
+        high_priority=True,
+    )
+
+    return {
+        "entry_id": entry_id,
+        "reference": reference,
+        "entry_fingerprint": fingerprint,
+        "vendor": vendor_name,
+        "gstin": gstin,
+        "hsn": hsn,
+        "total_amount": money_str(amount),
+        "date": imported_date.isoformat(),
+        "confidence": extracted.get("confidence", ""),
+        "notes": extracted.get("notes", ""),
+        "tally_export_file": filename,
+        "tally_export_path": str(export_path),
+    }
+
+
+def _flatten_json_records(payload: Any) -> list[dict[str, Any]]:
+    records: list[dict[str, Any]] = []
+    if isinstance(payload, dict):
+        records.append(payload)
+        for value in payload.values():
+            records.extend(_flatten_json_records(value))
+    elif isinstance(payload, list):
+        for item in payload:
+            records.extend(_flatten_json_records(item))
+    return records
+
+
+def _normalize_2b_record(raw: dict[str, Any]) -> dict[str, Any]:
+    gstin = _pick_value(
+        raw,
+        [
+            "gstin",
+            "ctin",
+            "supplier_gstin",
+            "vendor_gstin",
+            "counterparty_gstin",
+        ],
+    ).upper()
+    invoice_ref = _pick_value(raw, ["invoice_no", "invoice_number", "inum", "reference", "inv_no"])
+    invoice_date = _pick_value(raw, ["invoice_date", "idt", "date", "doc_date"])
+    taxable = _pick_value(raw, ["taxable_value", "txval", "assessable_value"])
+    tax_amt = _pick_value(raw, ["tax_amount", "iamt", "camt", "samt", "csamt", "gst_amount"])
+    total_amt = _pick_value(raw, ["total_amount", "total", "amount", "invoice_value", "val"])
+    vendor_name = _pick_value(raw, ["vendor", "supplier", "trade_name", "legal_name", "name"])
+    phone = _pick_value(raw, ["phone", "phone_number", "mobile", "contact", "whatsapp"])
+
+    return {
+        "gstin": gstin,
+        "invoice_reference": invoice_ref,
+        "invoice_date": invoice_date,
+        "taxable_value": money_str(parse_amount_from_text(taxable)),
+        "tax_amount": money_str(parse_amount_from_text(tax_amt)),
+        "total_amount": money_str(parse_amount_from_text(total_amt)),
+        "vendor_name": vendor_name,
+        "phone_number": phone,
+    }
+
+
+def _extract_2b_records(file_path: Path) -> list[dict[str, Any]]:
+    ext = file_path.suffix.lower()
+    raw_records: list[dict[str, Any]] = []
+
+    if ext in {".xlsx", ".xls", ".csv"}:
+        raw_records = _extract_excel_rows(file_path)
+    elif ext == ".json":
+        payload = json.loads(file_path.read_text(encoding="utf-8"))
+        raw_records = _flatten_json_records(payload)
+    else:
+        raise HTTPException(status_code=422, detail="Only JSON/Excel/CSV files are supported for 2B reconciliation")
+
+    normalized: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for raw in raw_records:
+        if not isinstance(raw, dict):
+            continue
+        item = _normalize_2b_record(raw)
+        if not item["gstin"]:
+            continue
+        if item["invoice_reference"]:
+            key = f"{item['gstin']}|{item['invoice_reference']}"
+        else:
+            key = f"{item['gstin']}|{item['tax_amount']}|{item['invoice_date']}"
+        if key in seen:
+            continue
+        seen.add(key)
+        normalized.append(item)
+    return normalized
+
+
+async def _draft_vendor_nudge_message(
+    *,
+    vendor_name: str,
+    gstin: str,
+    invoice_reference: str,
+    invoice_amount: str,
+    mismatch_reason: str = "",
+) -> dict[str, str]:
+    prompt = (
+        "Write a concise WhatsApp nudge in Indian business tone. "
+        "Objective: ask vendor to file missing invoice in GSTR-1 because ITC is blocked. "
+        "Return strict JSON with keys: message, urgency, subject. "
+        f"Vendor: {vendor_name}; GSTIN: {gstin}; Invoice: {invoice_reference}; Amount: {invoice_amount}; "
+        f"Mismatch context: {mismatch_reason or 'Invoice not reflected in GSTR-2B'}"
+    )
+
+    try:
+        raw = await run_ollama_generate(model=FORENSIC_MODEL, prompt=prompt)
+        parsed = parse_structured_json(raw)
+        if parsed.get("message"):
+            return {
+                "message": str(parsed.get("message", "")).strip(),
+                "urgency": str(parsed.get("urgency", "HIGH")).strip() or "HIGH",
+                "subject": str(parsed.get("subject", "GST Filing Action Required")).strip() or "GST Filing Action Required",
+            }
+    except Exception:  # noqa: BLE001
+        pass
+
+    message = (
+        f"Hi {vendor_name}, Accord AI flagged invoice {invoice_reference} (GSTIN {gstin}) as not reflected in GSTR-2B. "
+        "This is blocking our ITC claim. Please file/update GSTR-1 immediately to avoid payment withholding."
+    )
+    return {
+        "message": message,
+        "urgency": "HIGH",
+        "subject": "GST Filing Action Required",
+    }
+
+
+def _resolve_account_name(label: str, default_name: str) -> str:
+    normalized = (label or "").strip().lower()
+    aliases = {
+        "cash": "Cash",
+        "bank": "Bank",
+        "sales": "Sales Revenue",
+        "sale": "Sales Revenue",
+        "revenue": "Sales Revenue",
+        "purchase": "Purchases",
+        "purchases": "Purchases",
+        "expense": "Operating Expenses",
+        "expenses": "Operating Expenses",
+        "payable": "Accounts Payable",
+        "receivable": "Accounts Receivable",
+    }
+    return aliases.get(normalized, default_name)
+
+
+def _send_ca_invite_email(*, to_email: str, invite_link: str, expires_at: str) -> dict[str, str]:
+    if not SMTP_HOST:
+        return {"status": "skipped", "detail": "SMTP host not configured"}
+
+    message = EmailMessage()
+    message["From"] = SMTP_FROM_EMAIL
+    message["To"] = to_email
+    message["Subject"] = "Accord CA Invite: Join Sovereign Compliance Workspace"
+    message.set_content(
+        "You have been invited to Accord as a Chartered Accountant.\n\n"
+        f"Accept invite: {invite_link}\n"
+        f"Invite valid until: {expires_at}\n\n"
+        "If this was not expected, you can ignore this email."
+    )
+
+    try:
+        with smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=20) as smtp:
+            if SMTP_USE_TLS:
+                smtp.starttls()
+            if SMTP_USERNAME:
+                smtp.login(SMTP_USERNAME, SMTP_PASSWORD)
+            smtp.send_message(message)
+        return {"status": "sent", "detail": "SMTP delivery accepted"}
+    except Exception as exc:  # noqa: BLE001
+        return {"status": "failed", "detail": str(exc)}
+
+
+def _load_whisper_model() -> Any:
+    global WHISPER_MODEL_CACHE
+    if WHISPER_MODEL_CACHE is not None:
+        return WHISPER_MODEL_CACHE
+    if whisper_lib is None:
+        raise HTTPException(status_code=503, detail="openai-whisper package is not installed")
+    WHISPER_MODEL_CACHE = whisper_lib.load_model("base")
+    return WHISPER_MODEL_CACHE
+
+
+def _transcribe_audio_to_text(audio_path: Path) -> str:
+    model = _load_whisper_model()
+    result = model.transcribe(str(audio_path), language="en", fp16=False)
+    text = str(result.get("text", "")).strip()
+    if not text:
+        raise HTTPException(status_code=422, detail="Unable to transcribe audio into text")
+    return text
+
+
+async def _extract_voice_voucher(text: str) -> dict[str, Any]:
+    prompt = (
+        "Convert this speech transcript into a journal voucher. Return strict JSON with keys: "
+        "date, description, vendor, gstin, debit_account, credit_account, amount. "
+        "Use only these account names when possible: Cash, Bank, Sales Revenue, Purchases, Operating Expenses, Accounts Receivable, Accounts Payable. "
+        f"Transcript: {text}"
+    )
+    try:
+        raw = await run_ollama_generate(model=RECON_MODEL, prompt=prompt)
+        parsed = parse_structured_json(raw)
+        if parsed:
+            return parsed
+    except Exception:  # noqa: BLE001
+        pass
+
+    return {
+        "date": date.today().isoformat(),
+        "description": f"Voice command: {text[:140]}",
+        "vendor": "",
+        "gstin": "",
+        "debit_account": "Cash",
+        "credit_account": "Sales Revenue",
+        "amount": "0",
+    }
+
+
+def _build_nexus_graph(records: list[dict[str, Any]]) -> dict[str, Any]:
+    if nx is None:
+        return {
+            "status": "degraded",
+            "reason": "networkx not installed",
+            "risk_clusters": [],
+            "graph_file": None,
+        }
+
+    graph = nx.Graph()
+    graph.add_node("ACCORD_BUYER", kind="anchor")
+    bucket_to_vendors: dict[str, set[str]] = {}
+
+    for row in records:
+        gstin = str(row.get("counterparty_gstin") or row.get("gstin") or "").strip().upper()
+        if not gstin:
+            continue
+        amount = parse_amount_from_text(str(row.get("tax_amount", "0")))
+        bucket = f"AMT_{amount.quantize(Decimal('1.00'))}"
+
+        graph.add_node(gstin, kind="vendor")
+        graph.add_edge("ACCORD_BUYER", gstin, relation="purchase")
+        graph.add_node(bucket, kind="amount_bucket")
+        graph.add_edge(gstin, bucket, relation="same_tax_amount")
+        bucket_to_vendors.setdefault(bucket, set()).add(gstin)
+
+    risk_clusters: list[dict[str, Any]] = []
+    for bucket, vendors in bucket_to_vendors.items():
+        if len(vendors) >= 3:
+            risk_clusters.append(
+                {
+                    "severity": "CRITICAL_FRAUD_RISK",
+                    "bucket": bucket,
+                    "vendors": sorted(vendors),
+                    "reason": "3+ vendors share repeated tax amount bucket indicating potential circular-trading ring",
+                }
+            )
+
+    NEXUS_GRAPH_DIR.mkdir(parents=True, exist_ok=True)
+    graph_path = NEXUS_GRAPH_DIR / f"nexus_{datetime.utcnow().strftime('%Y%m%dT%H%M%S')}_{uuid.uuid4().hex}.json"
+    serialized = {
+        "nodes": [{"id": str(node), **attrs} for node, attrs in graph.nodes(data=True)],
+        "edges": [
+            {"source": str(source), "target": str(target), **attrs}
+            for source, target, attrs in graph.edges(data=True)
+        ],
+        "risk_clusters": risk_clusters,
+    }
+    graph_path.write_text(json.dumps(serialized, indent=2), encoding="utf-8")
+
+    return {
+        "status": "ok",
+        "nodes": graph.number_of_nodes(),
+        "edges": graph.number_of_edges(),
+        "risk_clusters": risk_clusters,
+        "graph_file": str(graph_path),
+    }
+
+
+def _extract_batch_candidate_worker(file_path_str: str, file_name: str, content_type: str) -> dict[str, Any]:
+    file_path = Path(file_path_str)
+    lower_name = file_name.lower()
+    lower_type = (content_type or "").lower()
+
+    is_excel = lower_name.endswith((".xlsx", ".xls", ".csv")) or "sheet" in lower_type or "excel" in lower_type
+    is_pdf = lower_name.endswith(".pdf") or lower_type == "application/pdf"
+    is_image = lower_name.endswith((".png", ".jpg", ".jpeg", ".webp")) or lower_type.startswith("image/")
+    is_video = lower_name.endswith((".mp4", ".mov", ".avi", ".mkv", ".m4v")) or lower_type.startswith("video/")
+
+    if not (is_excel or is_pdf or is_image or is_video):
+        return {
+            "status": "failed",
+            "file": file_name,
+            "reason": "Unsupported format",
+        }
+
+    raw_text = ""
+    extracted: dict[str, Any] = {}
+    pipeline = ""
+
+    try:
+        if is_excel:
+            pipeline = "OMNI_BATCH_EXCEL"
+            rows = _extract_excel_rows(file_path)
+            candidate = next(
+                (
+                    _row_to_ledger_fields(row)
+                    for row in rows
+                    if parse_amount_from_text(str(_row_to_ledger_fields(row).get("total_amount", "0"))) > 0
+                ),
+                None,
+            )
+            if candidate is None:
+                return {
+                    "status": "failed",
+                    "file": file_name,
+                    "reason": "No valid amount row found",
+                }
+            extracted = candidate
+
+        elif is_pdf:
+            pipeline = "OMNI_BATCH_PDF"
+            if fitz is None:
+                return {
+                    "status": "failed",
+                    "file": file_name,
+                    "reason": "pymupdf missing",
+                }
+
+            doc = fitz.open(file_path)
+            try:
+                text_chunks: list[str] = []
+                for page in doc:
+                    text_chunks.append(page.get_text("text") or "")
+                raw_text = "\n".join(text_chunks)
+            finally:
+                doc.close()
+
+            extracted = {
+                "date": "",
+                "vendor": "PDF Vendor",
+                "gstin": "",
+                "hsn": "",
+                "total_amount": money_str(parse_amount_from_text(raw_text)),
+                "confidence": "batch-pdf-heuristic",
+                "notes": raw_text[:700],
+            }
+
+        elif is_image:
+            pipeline = "OMNI_BATCH_IMAGE"
+            raw_text = extract_text_with_tesseract(file_path)
+            extracted = {
+                "date": "",
+                "vendor": "Image Vendor",
+                "gstin": "",
+                "hsn": "",
+                "total_amount": money_str(parse_amount_from_text(raw_text)),
+                "confidence": "batch-image-ocr",
+                "notes": raw_text[:700],
+            }
+
+        elif is_video:
+            pipeline = "OMNI_BATCH_VIDEO"
+            if cv2 is None:
+                return {
+                    "status": "failed",
+                    "file": file_name,
+                    "reason": "opencv missing",
+                }
+            capture = cv2.VideoCapture(str(file_path))
+            if not capture.isOpened():
+                return {
+                    "status": "failed",
+                    "file": file_name,
+                    "reason": "Cannot open video",
+                }
+
+            try:
+                frame_count = int(capture.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
+                frame_no = max(0, frame_count // 3)
+                capture.set(cv2.CAP_PROP_POS_FRAMES, frame_no)
+                ok, frame = capture.read()
+                if not ok or frame is None:
+                    return {
+                        "status": "failed",
+                        "file": file_name,
+                        "reason": "No readable frame in video",
+                    }
+
+                temp_frame = file_path.with_suffix(".batch_frame.jpg")
+                cv2.imwrite(str(temp_frame), frame)
+                try:
+                    raw_text = extract_text_with_tesseract(temp_frame)
+                finally:
+                    temp_frame.unlink(missing_ok=True)
+            finally:
+                capture.release()
+
+            extracted = {
+                "date": "",
+                "vendor": "Video Vendor",
+                "gstin": "",
+                "hsn": "",
+                "total_amount": money_str(parse_amount_from_text(raw_text)),
+                "confidence": "batch-video-ocr",
+                "notes": raw_text[:700],
+            }
+
+        amount = parse_amount_from_text(str(extracted.get("total_amount", "0")))
+        if amount <= 0:
+            return {
+                "status": "failed",
+                "file": file_name,
+                "reason": "No valid amount detected",
+            }
+
+        return {
+            "status": "ok",
+            "file": file_name,
+            "pipeline": pipeline,
+            "raw_text": raw_text,
+            "extracted": extracted,
+        }
+    except Exception as exc:  # noqa: BLE001
+        return {
+            "status": "failed",
+            "file": file_name,
+            "reason": str(exc),
+        }
+
 class NeuralInk:
     @staticmethod
     async def reconstruct(raw_ocr_text: str) -> tuple[dict[str, Any], str]:
@@ -624,6 +1361,22 @@ class GstnEclBridgeIn(BaseModel):
     gstin: str = Field(min_length=15, max_length=15)
     as_of_date: date | None = None
     period: str | None = Field(default=None, max_length=20)
+
+
+class VendorNudgeIn(BaseModel):
+    gstin: str = Field(min_length=15, max_length=15)
+    vendor_name: str | None = Field(default=None, max_length=200)
+    invoice_reference: str | None = Field(default=None, max_length=100)
+    invoice_amount: Decimal | None = Field(default=None, ge=0)
+    phone_number: str | None = Field(default=None, max_length=20)
+    mismatch_reason: str | None = Field(default=None, max_length=500)
+
+
+class MarketingSignupIn(BaseModel):
+    name: str = Field(min_length=2, max_length=120)
+    email: str = Field(min_length=5, max_length=320)
+    provider: str = Field(default="EMAIL", min_length=3, max_length=20)
+    source: str = Field(default="public-signup", min_length=2, max_length=80)
 
 
 app = FastAPI(title="Friday Insights Ledger API", version="1.0.0")
@@ -790,6 +1543,16 @@ def init_db() -> None:
                 FOREIGN KEY(entry_id) REFERENCES journal_entries(id) ON DELETE SET NULL
             );
 
+            CREATE TABLE IF NOT EXISTS marketing_signups (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                name TEXT NOT NULL,
+                email TEXT NOT NULL UNIQUE,
+                provider TEXT NOT NULL,
+                source TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
+
             CREATE TABLE IF NOT EXISTS journal_lines (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 entry_id INTEGER NOT NULL,
@@ -824,6 +1587,7 @@ def init_db() -> None:
             CREATE INDEX IF NOT EXISTS idx_ca_invites_email_status ON ca_invites(email, status);
             CREATE INDEX IF NOT EXISTS idx_ca_invites_expires_status ON ca_invites(expires_at, status);
             CREATE INDEX IF NOT EXISTS idx_receipt_imports_entry ON receipt_imports(entry_id);
+            CREATE INDEX IF NOT EXISTS idx_marketing_signups_updated_at ON marketing_signups(updated_at);
             """
         )
 
@@ -1063,13 +1827,29 @@ def migrate_legacy_schema(conn: sqlite3.Connection) -> None:
             FOREIGN KEY(entry_id) REFERENCES journal_entries(id) ON DELETE SET NULL
         );
 
+        CREATE TABLE IF NOT EXISTS marketing_signups (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            name TEXT NOT NULL,
+            email TEXT NOT NULL UNIQUE,
+            provider TEXT NOT NULL,
+            source TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        );
+
         CREATE INDEX IF NOT EXISTS idx_vendor_trust_score ON vendor_trust_scores(filing_consistency_score);
         CREATE INDEX IF NOT EXISTS idx_safe_harbor_attestations_as_of ON safe_harbor_attestations(as_of_date, created_at);
         CREATE INDEX IF NOT EXISTS idx_ca_invites_email_status ON ca_invites(email, status);
         CREATE INDEX IF NOT EXISTS idx_ca_invites_expires_status ON ca_invites(expires_at, status);
         CREATE INDEX IF NOT EXISTS idx_receipt_imports_entry ON receipt_imports(entry_id);
+        CREATE INDEX IF NOT EXISTS idx_marketing_signups_updated_at ON marketing_signups(updated_at);
         """
     )
+
+    if not table_has_column(conn, "marketing_signups", "updated_at"):
+        conn.execute(
+            "ALTER TABLE marketing_signups ADD COLUMN updated_at TEXT NOT NULL DEFAULT '1970-01-01T00:00:00Z';"
+        )
 
     if not table_has_column(conn, "tax_ledger", "is_inter_state"):
         conn.execute(
@@ -1766,9 +2546,84 @@ def validate_invite_email(email: str) -> str:
     return normalized
 
 
+def validate_marketing_email(email: str) -> str:
+    normalized = email.strip().lower()
+    if not re.fullmatch(r"[^@\s]+@[^@\s]+\.[^@\s]+", normalized):
+        raise HTTPException(status_code=422, detail="A valid email is required")
+    return normalized
+
+
 def issue_ca_invite_token(email: str, issued_by: int) -> str:
     seed = f"{email}:{issued_by}:{datetime.utcnow().isoformat(timespec='microseconds')}:{secrets.token_urlsafe(32)}"
     return sha256(seed.encode("utf-8")).hexdigest()
+
+
+@app.post("/api/v1/marketing/signup")
+def post_marketing_signup(payload: MarketingSignupIn) -> dict[str, Any]:
+    normalized_name = payload.name.strip()
+    if len(normalized_name) < 2:
+        raise HTTPException(status_code=422, detail="Name must be at least 2 characters")
+
+    normalized_email = validate_marketing_email(payload.email)
+    provider = payload.provider.strip().upper()
+    if provider not in {"EMAIL", "GOOGLE", "APPLE"}:
+        raise HTTPException(status_code=422, detail="provider must be one of EMAIL, GOOGLE, APPLE")
+
+    source = payload.source.strip().lower() or "public-signup"
+    now_iso = datetime.utcnow().isoformat(timespec="seconds") + "Z"
+
+    with closing(get_conn()) as conn:
+        conn.execute("BEGIN")
+        conn.execute(
+            """
+            INSERT INTO marketing_signups(name, email, provider, source, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?)
+            ON CONFLICT(email) DO UPDATE SET
+                name = excluded.name,
+                provider = excluded.provider,
+                source = excluded.source,
+                updated_at = excluded.updated_at
+            """,
+            (normalized_name, normalized_email, provider, source, now_iso, now_iso),
+        )
+
+        record = conn.execute(
+            """
+            SELECT id, created_at, updated_at
+            FROM marketing_signups
+            WHERE email = ?
+            LIMIT 1
+            """,
+            (normalized_email,),
+        ).fetchone()
+
+        record_id = int(record["id"]) if record else 0
+        log_audit(
+            conn,
+            table_name="marketing_signups",
+            record_id=record_id,
+            action="MARKETING_SIGNUP_CAPTURED",
+            old_value=None,
+            new_value={
+                "name": normalized_name,
+                "email": normalized_email,
+                "provider": provider,
+                "source": source,
+            },
+            user_id=0,
+            high_priority=False,
+        )
+        conn.commit()
+
+    return {
+        "status": "captured",
+        "id": record_id,
+        "name": normalized_name,
+        "email": normalized_email,
+        "provider": provider,
+        "source": source,
+        "captured_at": now_iso,
+    }
 
 
 @app.post("/api/v1/auth/biometric-token")
@@ -1802,6 +2657,7 @@ def invite_ca(
     now_iso = datetime.utcnow().isoformat(timespec="seconds") + "Z"
     expires_at = datetime.utcnow() + timedelta(days=7)
     expires_at_iso = expires_at.isoformat(timespec="seconds") + "Z"
+    invite_link = ""
 
     with closing(get_conn()) as conn:
         try:
@@ -1834,6 +2690,8 @@ def invite_ca(
                 invite_token = token
                 invite_expires_at = expires_at_iso
 
+            invite_link = f"http://localhost:3000/ca/accept/{invite_token}"
+
             log_audit(
                 conn,
                 table_name="ca_invites",
@@ -1857,12 +2715,35 @@ def invite_ca(
             conn.rollback()
             raise HTTPException(status_code=500, detail=f"Unable to create CA invite: {exc}") from exc
 
+    email_delivery = _send_ca_invite_email(to_email=normalized_email, invite_link=invite_link, expires_at=invite_expires_at)
+    with closing(get_conn()) as conn:
+        conn.execute("BEGIN")
+        log_audit(
+            conn,
+            table_name="ca_invites",
+            record_id=invite_id,
+            action="CA_INVITE_EMAIL_DISPATCH",
+            old_value=None,
+            new_value={
+                "email": normalized_email,
+                "invite_token": invite_token,
+                "invite_link": invite_link,
+                "email_status": email_delivery["status"],
+                "email_detail": email_delivery["detail"],
+                "actor_role": role,
+            },
+            user_id=admin_id,
+            high_priority=False,
+        )
+        conn.commit()
+
     return {
         "status": "success",
         "email": normalized_email,
         "invite_token": invite_token,
         "expires_at": invite_expires_at,
-        "invite_link": f"http://localhost:3000/ca/accept/{invite_token}",
+        "invite_link": invite_link,
+        "email_delivery": email_delivery,
     }
 
 
@@ -2018,6 +2899,78 @@ def get_ca_audit_summary(
         "window_hours": safe_hours,
         "count": len(items),
         "entries": items,
+    }
+
+
+@app.get("/api/v1/ca/network-integrity")
+def get_ca_network_integrity(
+    limit: int = 100,
+    x_role: str | None = Header(default=None, alias="X-Role"),
+    x_admin_id: str | None = Header(default=None, alias="X-Admin-Id"),
+) -> dict[str, Any]:
+    require_role(x_role, {"ca", "admin"})
+    require_admin_id(x_admin_id)
+    safe_limit = min(max(limit, 1), 500)
+
+    with closing(get_conn()) as conn:
+        rows = conn.execute(
+            """
+            SELECT COALESCE(counterparty_gstin, '-') AS gstin,
+                   COALESCE(vendor_legal_name, 'Unknown Vendor') AS vendor_name,
+                   COUNT(*) AS total_entries,
+                   SUM(CASE WHEN entry_fingerprint IS NOT NULL AND entry_fingerprint != '' THEN 1 ELSE 0 END) AS verified_entries,
+                   MAX(created_at) AS last_activity
+            FROM journal_entries
+            WHERE status = 'POSTED'
+            GROUP BY COALESCE(counterparty_gstin, '-'), COALESCE(vendor_legal_name, 'Unknown Vendor')
+            ORDER BY total_entries DESC, last_activity DESC
+            LIMIT ?
+            """,
+            (safe_limit,),
+        ).fetchall()
+
+        accepted_clients = conn.execute(
+            """
+            SELECT COUNT(*) AS accepted_count
+            FROM ca_invites
+            WHERE status = 'ACCEPTED'
+            """
+        ).fetchone()
+
+    tenants: list[dict[str, Any]] = []
+    total_entries = 0
+    total_verified = 0
+
+    for row in rows:
+        entries = int(row["total_entries"] or 0)
+        verified = int(row["verified_entries"] or 0)
+        score = round((verified / entries) * 100, 2) if entries > 0 else 100.0
+        total_entries += entries
+        total_verified += verified
+        tenants.append(
+            {
+                "gstin": str(row["gstin"]),
+                "vendor_name": str(row["vendor_name"]),
+                "total_entries": entries,
+                "verified_entries": verified,
+                "integrity_score": score,
+                "last_activity": str(row["last_activity"] or ""),
+                "read_only": True,
+                "hash_algorithm": "SHA-256",
+            }
+        )
+
+    aggregate_score = round((total_verified / total_entries) * 100, 2) if total_entries > 0 else 100.0
+
+    accepted_count = int(accepted_clients["accepted_count"]) if accepted_clients is not None else 0
+
+    return {
+        "status": "ok",
+        "hash_algorithm": "SHA-256",
+        "aggregate_integrity_score": aggregate_score,
+        "tenants": tenants,
+        "tenant_count": len(tenants),
+        "accepted_clients": accepted_count,
     }
 
 
@@ -2437,6 +3390,599 @@ async def neural_ink_to_ledger(
             "confidence": extracted.get("confidence", ""),
             "notes": extracted.get("notes", ""),
         },
+    }
+
+
+@app.post("/api/v1/ledger/ingest")
+async def omni_reader_ingest(
+    file: UploadFile = File(...),
+    x_role: str | None = Header(default=None, alias="X-Role"),
+    x_admin_id: str | None = Header(default=None, alias="X-Admin-Id"),
+) -> dict[str, Any]:
+    role = require_role(x_role, {"admin", "ca"})
+    admin_id = require_admin_id(x_admin_id)
+
+    if not file.filename:
+        raise HTTPException(status_code=400, detail="Missing file name")
+
+    content_type = (file.content_type or "").lower()
+    name = file.filename.lower()
+
+    is_excel = name.endswith((".xlsx", ".xls", ".csv")) or "sheet" in content_type or "excel" in content_type
+    is_pdf = name.endswith(".pdf") or content_type == "application/pdf"
+    is_image = name.endswith((".png", ".jpg", ".jpeg", ".webp")) or content_type.startswith("image/")
+    is_video = name.endswith((".mp4", ".mov", ".avi", ".mkv", ".m4v")) or content_type.startswith("video/")
+
+    if not (is_excel or is_pdf or is_image or is_video):
+        raise HTTPException(status_code=422, detail="Supported formats: Excel/CSV, PDF, PNG/JPEG/WEBP, MP4/MOV/AVI/MKV")
+
+    raw = await file.read()
+    if not raw:
+        raise HTTPException(status_code=400, detail="Uploaded file is empty")
+
+    OMNI_INGEST_DIR.mkdir(parents=True, exist_ok=True)
+    PROCESSED_ARCHIVE_DIR.mkdir(parents=True, exist_ok=True)
+    ext = Path(file.filename).suffix.lower() or ".bin"
+    ingest_name = f"omni_{datetime.utcnow().strftime('%Y%m%dT%H%M%S')}_{uuid.uuid4().hex}{ext}"
+    ingest_path = OMNI_INGEST_DIR / ingest_name
+    ingest_path.write_bytes(raw)
+
+    results: list[dict[str, Any]] = []
+    pipeline = ""
+
+    if is_excel:
+        pipeline = "OMNI_EXCEL"
+        rows = _extract_excel_rows(ingest_path)
+        if not rows:
+            raise HTTPException(status_code=422, detail="Excel/CSV contains no readable rows")
+
+        for index, row in enumerate(rows, start=1):
+            extracted = _row_to_ledger_fields(row)
+            if parse_amount_from_text(str(extracted.get("total_amount", "0"))) <= 0:
+                continue
+
+            with closing(get_conn()) as conn:
+                try:
+                    entry = _post_ledger_entry_from_extract(
+                        conn=conn,
+                        extracted=extracted,
+                        fallback_text=json.dumps(row),
+                        description_prefix=f"Omni-Reader Excel row {index}",
+                        actor_role=role,
+                        admin_id=admin_id,
+                        source_file_path=ingest_path,
+                        model_response="",
+                        import_status="OMNI_EXCEL",
+                    )
+                    conn.commit()
+                    results.append(entry)
+                except HTTPException:
+                    conn.rollback()
+                    raise
+                except Exception as exc:  # noqa: BLE001
+                    conn.rollback()
+                    raise HTTPException(status_code=500, detail=f"Failed to post Excel row {index}: {exc}") from exc
+
+        if not results:
+            raise HTTPException(status_code=422, detail="No rows produced a valid amount for ledger posting")
+
+    else:
+        extracted: dict[str, Any] = {}
+        model_response = ""
+        fallback_text = ""
+
+        if is_pdf:
+            pipeline = "OMNI_PDF"
+            extracted, model_response, fallback_text = await _extract_from_pdf(ingest_path)
+        elif is_image:
+            pipeline = "OMNI_IMAGE"
+            fallback_text = extract_text_with_tesseract(ingest_path)
+            extracted, model_response = await extract_receipt_fields(ingest_path, fallback_text)
+        else:
+            pipeline = "OMNI_VIDEO"
+            extracted, model_response, fallback_text = await _extract_from_video(ingest_path)
+
+        with closing(get_conn()) as conn:
+            try:
+                entry = _post_ledger_entry_from_extract(
+                    conn=conn,
+                    extracted=extracted,
+                    fallback_text=fallback_text,
+                    description_prefix=f"Omni-Reader {pipeline}",
+                    actor_role=role,
+                    admin_id=admin_id,
+                    source_file_path=ingest_path,
+                    model_response=model_response,
+                    import_status=pipeline,
+                )
+                conn.commit()
+                results.append(entry)
+            except HTTPException:
+                conn.rollback()
+                raise
+            except Exception as exc:  # noqa: BLE001
+                conn.rollback()
+                raise HTTPException(status_code=500, detail=f"Failed Omni-Reader ingestion: {exc}") from exc
+
+    archived_path = PROCESSED_ARCHIVE_DIR / ingest_name
+    shutil.copy2(ingest_path, archived_path)
+
+    return {
+        "status": "processed",
+        "pipeline": pipeline,
+        "input_file": str(ingest_path),
+        "archive_file": str(archived_path),
+        "entries_created": len(results),
+        "results": results,
+    }
+
+
+@app.post("/api/v1/ledger/ingest-batch")
+async def omni_reader_ingest_batch(
+    files: list[UploadFile] = File(...),
+    x_role: str | None = Header(default=None, alias="X-Role"),
+    x_admin_id: str | None = Header(default=None, alias="X-Admin-Id"),
+) -> dict[str, Any]:
+    role = require_role(x_role, {"admin", "ca"})
+    admin_id = require_admin_id(x_admin_id)
+
+    if not files:
+        raise HTTPException(status_code=400, detail="At least one file is required")
+    if len(files) > 50:
+        raise HTTPException(status_code=422, detail="Maximum 50 files per mixed batch")
+
+    OMNI_INGEST_DIR.mkdir(parents=True, exist_ok=True)
+    PROCESSED_ARCHIVE_DIR.mkdir(parents=True, exist_ok=True)
+
+    saved_files: list[dict[str, str]] = []
+    for file in files:
+        if not file.filename:
+            continue
+        raw = await file.read()
+        if not raw:
+            continue
+        ext = Path(file.filename).suffix.lower() or ".bin"
+        ingest_name = f"batch_{datetime.utcnow().strftime('%Y%m%dT%H%M%S')}_{uuid.uuid4().hex}{ext}"
+        ingest_path = OMNI_INGEST_DIR / ingest_name
+        ingest_path.write_bytes(raw)
+        saved_files.append(
+            {
+                "file_name": file.filename,
+                "content_type": file.content_type or "",
+                "path": str(ingest_path),
+            }
+        )
+
+    if not saved_files:
+        raise HTTPException(status_code=400, detail="No readable files found in batch")
+
+    workers = min(12, len(saved_files))
+    extracted_results: list[dict[str, Any]] = []
+
+    with ProcessPoolExecutor(max_workers=workers) as executor:
+        futures: list[tuple[dict[str, str], Any]] = []
+        for item in saved_files:
+            future = executor.submit(
+                _extract_batch_candidate_worker,
+                item["path"],
+                item["file_name"],
+                item["content_type"],
+            )
+            futures.append((item, future))
+
+        for item, future in futures:
+            extracted = future.result()
+            extracted_results.append({
+                "meta": item,
+                "result": extracted,
+            })
+
+    posted: list[dict[str, Any]] = []
+    failed: list[dict[str, Any]] = []
+
+    for bundle in extracted_results:
+        item = bundle["meta"]
+        result = bundle["result"]
+        source_path = Path(item["path"])
+
+        if result.get("status") != "ok":
+            failed.append(
+                {
+                    "file": item["file_name"],
+                    "reason": result.get("reason", "Unknown extraction failure"),
+                }
+            )
+            continue
+
+        try:
+            with closing(get_conn()) as conn:
+                entry = _post_ledger_entry_from_extract(
+                    conn=conn,
+                    extracted=result.get("extracted") or {},
+                    fallback_text=str(result.get("raw_text", "")),
+                    description_prefix=f"Omni-Mixed {result.get('pipeline', 'BATCH')}",
+                    actor_role=role,
+                    admin_id=admin_id,
+                    source_file_path=source_path,
+                    model_response="",
+                    import_status=str(result.get("pipeline", "OMNI_BATCH")),
+                )
+                conn.commit()
+                posted.append(
+                    {
+                        "file": item["file_name"],
+                        "pipeline": result.get("pipeline"),
+                        "entry": entry,
+                    }
+                )
+        except Exception as exc:  # noqa: BLE001
+            failed.append(
+                {
+                    "file": item["file_name"],
+                    "reason": str(exc),
+                }
+            )
+
+        archived = PROCESSED_ARCHIVE_DIR / source_path.name
+        shutil.copy2(source_path, archived)
+
+    return {
+        "status": "processed",
+        "engine": "OMNI_GOD_MODE",
+        "worker_model": f"ProcessPoolExecutor({workers})",
+        "submitted": len(saved_files),
+        "posted_entries": len(posted),
+        "failed_entries": len(failed),
+        "results": posted,
+        "failures": failed,
+    }
+
+
+@app.post("/api/v1/ledger/voice-cmd")
+async def post_voice_command(
+    file: UploadFile = File(...),
+    x_role: str | None = Header(default=None, alias="X-Role"),
+    x_admin_id: str | None = Header(default=None, alias="X-Admin-Id"),
+) -> dict[str, Any]:
+    role = require_role(x_role, {"admin", "ca"})
+    admin_id = require_admin_id(x_admin_id)
+
+    if not file.filename:
+        raise HTTPException(status_code=400, detail="Missing audio file name")
+
+    content_type = (file.content_type or "").lower()
+    if not (content_type.startswith("audio/") or file.filename.lower().endswith((".wav", ".mp3", ".m4a", ".aac", ".ogg"))):
+        raise HTTPException(status_code=422, detail="Supported voice formats: WAV, MP3, M4A, AAC, OGG")
+
+    raw = await file.read()
+    if not raw:
+        raise HTTPException(status_code=400, detail="Uploaded audio is empty")
+
+    RAM_DISK_BUFFER.mkdir(parents=True, exist_ok=True)
+    ext = Path(file.filename).suffix.lower() or ".wav"
+    audio_path = RAM_DISK_BUFFER / f"voice_{datetime.utcnow().strftime('%Y%m%dT%H%M%S')}_{uuid.uuid4().hex}{ext}"
+    audio_path.write_bytes(raw)
+
+    try:
+        transcript = _transcribe_audio_to_text(audio_path)
+        parsed = await _extract_voice_voucher(transcript)
+
+        amount = parse_amount_from_text(str(parsed.get("amount", "0")))
+        if amount <= 0:
+            amount = parse_amount_from_text(transcript)
+        if amount <= 0:
+            raise HTTPException(status_code=422, detail="Voice command does not contain a valid amount")
+
+        debit_name = _resolve_account_name(str(parsed.get("debit_account", "")), "Cash")
+        credit_name = _resolve_account_name(str(parsed.get("credit_account", "")), "Sales Revenue")
+        posted_date = parse_date_from_text(str(parsed.get("date", "")))
+        vendor_name = str(parsed.get("vendor", "")).strip() or "Voice Counterparty"
+        gstin = str(parsed.get("gstin", "")).strip().upper()
+        description = str(parsed.get("description", "")).strip() or f"Voice command: {transcript[:120]}"
+
+        with closing(get_conn()) as conn:
+            try:
+                check_period_lock(conn, posted_date)
+                reference = next_journal_reference(conn, posted_date)
+                debit_id = get_account_id_by_name(conn, debit_name)
+                credit_id = get_account_id_by_name(conn, credit_name)
+                created_at = datetime.utcnow().isoformat(timespec="seconds") + "Z"
+
+                conn.execute(
+                    """
+                    INSERT INTO journal_entries(
+                        date, reference, description, company_state_code, counterparty_state_code,
+                        counterparty_gstin, eco_gstin, supply_source, ims_status, vendor_legal_name,
+                        vendor_gstr1_filed_at, status, reversal_of_id, is_filed, filed_at,
+                        filed_export_hash, approved_by_1, approved_by_2, created_at
+                    ) VALUES (?, ?, ?, NULL, NULL, ?, NULL, 'DIRECT', 'PENDING', ?, NULL, 'POSTED', NULL, 0, NULL, NULL, NULL, NULL, ?)
+                    """,
+                    (
+                        posted_date.isoformat(),
+                        reference,
+                        description,
+                        gstin or None,
+                        vendor_name,
+                        created_at,
+                    ),
+                )
+                entry_id = int(conn.execute("SELECT last_insert_rowid() AS id").fetchone()["id"])
+
+                conn.execute(
+                    "INSERT INTO journal_lines(entry_id, account_id, debit, credit) VALUES (?, ?, ?, ?)",
+                    (entry_id, debit_id, money_str(amount), "0.0000"),
+                )
+                update_account_balance(conn, debit_id, amount, Decimal("0"))
+
+                conn.execute(
+                    "INSERT INTO journal_lines(entry_id, account_id, debit, credit) VALUES (?, ?, ?, ?)",
+                    (entry_id, credit_id, "0.0000", money_str(amount)),
+                )
+                update_account_balance(conn, credit_id, Decimal("0"), amount)
+                fingerprint = stamp_entry_fingerprint(conn, entry_id)
+
+                log_audit(
+                    conn,
+                    table_name="journal_entries",
+                    record_id=entry_id,
+                    action="VOICE_CMD_IMPORT",
+                    old_value=None,
+                    new_value={
+                        "reference": reference,
+                        "transcript": transcript,
+                        "debit_account": debit_name,
+                        "credit_account": credit_name,
+                        "amount": money_str(amount),
+                        "entry_fingerprint": fingerprint,
+                        "actor_role": role,
+                    },
+                    user_id=admin_id,
+                    high_priority=True,
+                )
+                conn.commit()
+            except HTTPException:
+                conn.rollback()
+                raise
+            except Exception as exc:  # noqa: BLE001
+                conn.rollback()
+                raise HTTPException(status_code=500, detail=f"Failed to post voice command: {exc}") from exc
+    finally:
+        audio_path.unlink(missing_ok=True)
+
+    return {
+        "status": "processed",
+        "pipeline": "VOICE_TO_LEDGER",
+        "transcript": transcript,
+        "parsed_voucher": {
+            "date": posted_date.isoformat(),
+            "vendor": vendor_name,
+            "gstin": gstin,
+            "debit_account": debit_name,
+            "credit_account": credit_name,
+            "amount": money_str(amount),
+            "description": description,
+        },
+        "entry_id": entry_id,
+        "reference": reference,
+        "entry_fingerprint": fingerprint,
+    }
+
+
+@app.post("/api/v1/ledger/nudge-vendor")
+async def post_nudge_vendor(
+    payload: VendorNudgeIn,
+    x_role: str | None = Header(default=None, alias="X-Role"),
+    x_admin_id: str | None = Header(default=None, alias="X-Admin-Id"),
+) -> dict[str, Any]:
+    role = require_role(x_role, {"admin", "ca"})
+    admin_id = require_admin_id(x_admin_id)
+
+    gstin = validate_gstin(payload.gstin)
+    vendor_name = (payload.vendor_name or "Vendor").strip() or "Vendor"
+    invoice_reference = (payload.invoice_reference or "Unknown").strip() or "Unknown"
+    invoice_amount = money_str(payload.invoice_amount) if payload.invoice_amount is not None else "0.0000"
+
+    nudge = await _draft_vendor_nudge_message(
+        vendor_name=vendor_name,
+        gstin=gstin,
+        invoice_reference=invoice_reference,
+        invoice_amount=invoice_amount,
+        mismatch_reason=(payload.mismatch_reason or "").strip(),
+    )
+
+    twilio_status = "not_attempted"
+    if payload.phone_number:
+        sid = os.getenv("TWILIO_ACCOUNT_SID")
+        token = os.getenv("TWILIO_AUTH_TOKEN")
+        from_whatsapp = os.getenv("TWILIO_WHATSAPP_FROM")
+        if sid and token and from_whatsapp:
+            try:
+                from twilio.rest import Client  # type: ignore
+
+                client = Client(sid, token)
+                client.messages.create(
+                    body=nudge["message"],
+                    from_=from_whatsapp,
+                    to=f"whatsapp:{payload.phone_number}",
+                )
+                twilio_status = "sent"
+            except Exception as exc:  # noqa: BLE001
+                twilio_status = f"failed: {exc}"
+        else:
+            twilio_status = "skipped: missing Twilio credentials"
+
+    with closing(get_conn()) as conn:
+        conn.execute("BEGIN")
+        log_audit(
+            conn,
+            table_name="vendor_trust_scores",
+            record_id=0,
+            action="VENDOR_NUDGE_GENERATED",
+            old_value=None,
+            new_value={
+                "gstin": gstin,
+                "vendor_name": vendor_name,
+                "invoice_reference": invoice_reference,
+                "invoice_amount": invoice_amount,
+                "urgency": nudge["urgency"],
+                "twilio_status": twilio_status,
+                "actor_role": role,
+            },
+            user_id=admin_id,
+            high_priority=True,
+        )
+        conn.commit()
+
+    return {
+        "status": "generated",
+        "gstin": gstin,
+        "vendor_name": vendor_name,
+        "subject": nudge["subject"],
+        "urgency": nudge["urgency"],
+        "whatsapp_message": nudge["message"],
+        "twilio_status": twilio_status,
+    }
+
+
+@app.post("/api/v1/ledger/reconcile-2b")
+async def post_reconcile_2b(
+    file: UploadFile = File(...),
+    x_role: str | None = Header(default=None, alias="X-Role"),
+    x_admin_id: str | None = Header(default=None, alias="X-Admin-Id"),
+) -> dict[str, Any]:
+    role = require_role(x_role, {"admin", "ca"})
+    admin_id = require_admin_id(x_admin_id)
+
+    if not file.filename:
+        raise HTTPException(status_code=400, detail="Missing 2B file name")
+
+    raw = await file.read()
+    if not raw:
+        raise HTTPException(status_code=400, detail="Uploaded 2B file is empty")
+
+    OMNI_INGEST_DIR.mkdir(parents=True, exist_ok=True)
+    ext = Path(file.filename).suffix.lower() or ".json"
+    two_b_path = OMNI_INGEST_DIR / f"gstr2b_{datetime.utcnow().strftime('%Y%m%dT%H%M%S')}_{uuid.uuid4().hex}{ext}"
+    two_b_path.write_bytes(raw)
+
+    records_2b = _extract_2b_records(two_b_path)
+    if not records_2b:
+        raise HTTPException(status_code=422, detail="No valid invoice records found in uploaded 2B payload")
+
+    two_b_index: set[str] = set()
+    for row in records_2b:
+        if row["invoice_reference"]:
+            two_b_index.add(f"{row['gstin']}|{row['invoice_reference']}")
+        two_b_index.add(f"{row['gstin']}|{row['tax_amount']}|{row['invoice_date']}")
+
+    with closing(get_conn()) as conn:
+        ledger_rows = conn.execute(
+            """
+            SELECT je.id,
+                   je.reference,
+                   je.date,
+                   je.counterparty_gstin,
+                   je.vendor_legal_name,
+                   tl.tax_amount,
+                   tl.taxable_value
+            FROM tax_ledger tl
+            JOIN journal_entries je ON je.id = tl.entry_id
+            WHERE tl.supply_type = 'B2B'
+              AND je.status = 'POSTED'
+            ORDER BY je.date DESC, je.id DESC
+            """
+        ).fetchall()
+
+    ghost_invoices: list[dict[str, Any]] = []
+    for row in ledger_rows:
+        gstin = str(row["counterparty_gstin"] or "").strip().upper()
+        if not gstin:
+            continue
+        reference = str(row["reference"])
+        row_date = str(row["date"])
+        tax_amt = money_str(parse_amount_from_text(str(row["tax_amount"])))
+        strong_key = f"{gstin}|{reference}"
+        weak_key = f"{gstin}|{tax_amt}|{row_date}"
+        if strong_key in two_b_index or weak_key in two_b_index:
+            continue
+
+        nudge = await _draft_vendor_nudge_message(
+            vendor_name=str(row["vendor_legal_name"] or "Vendor"),
+            gstin=gstin,
+            invoice_reference=reference,
+            invoice_amount=money_str(parse_amount_from_text(str(row["taxable_value"]))),
+            mismatch_reason="Ledger invoice not found in uploaded GSTR-2B dataset",
+        )
+        ghost_invoices.append(
+            {
+                "entry_id": int(row["id"]),
+                "reference": reference,
+                "date": row_date,
+                "gstin": gstin,
+                "vendor_name": str(row["vendor_legal_name"] or "Vendor"),
+                "tax_amount": tax_amt,
+                "taxable_value": money_str(parse_amount_from_text(str(row["taxable_value"]))),
+                "risk": "GHOST_INVOICE",
+                "nudge_template": nudge,
+            }
+        )
+
+    nexus_graph = _build_nexus_graph([dict(row) for row in ledger_rows])
+
+    with closing(get_conn()) as conn:
+        conn.execute("BEGIN")
+        log_audit(
+            conn,
+            table_name="reports",
+            record_id=0,
+            action="GSTR_2B_RECONCILIATION",
+            old_value=None,
+            new_value={
+                "uploaded_records": len(records_2b),
+                "ledger_records": len(ledger_rows),
+                "ghost_invoices": len(ghost_invoices),
+                "nexus_risk_clusters": len(nexus_graph.get("risk_clusters", [])),
+                "two_b_file": str(two_b_path),
+                "actor_role": role,
+            },
+            user_id=admin_id,
+            high_priority=True,
+        )
+        conn.commit()
+
+    return {
+        "status": "reconciled",
+        "uploaded_records": len(records_2b),
+        "ledger_records": len(ledger_rows),
+        "ghost_invoices_count": len(ghost_invoices),
+        "ghost_invoices": ghost_invoices,
+        "nexus_graph": nexus_graph,
+        "source_file": str(two_b_path),
+    }
+
+
+@app.get("/api/v1/ledger/nexus-graph/latest")
+def get_latest_nexus_graph(
+    x_role: str | None = Header(default=None, alias="X-Role"),
+    x_admin_id: str | None = Header(default=None, alias="X-Admin-Id"),
+) -> dict[str, Any]:
+    require_role(x_role, {"admin", "ca"})
+    require_admin_id(x_admin_id)
+
+    if not NEXUS_GRAPH_DIR.exists():
+        raise HTTPException(status_code=404, detail="No nexus graph has been generated yet")
+
+    candidates = sorted(NEXUS_GRAPH_DIR.glob("nexus_*.json"), key=lambda p: p.stat().st_mtime, reverse=True)
+    if not candidates:
+        raise HTTPException(status_code=404, detail="No nexus graph has been generated yet")
+
+    latest = candidates[0]
+    payload = json.loads(latest.read_text(encoding="utf-8"))
+    return {
+        "status": "ok",
+        "graph_file": str(latest),
+        "generated_at": datetime.utcfromtimestamp(latest.stat().st_mtime).isoformat(timespec="seconds") + "Z",
+        **payload,
     }
 
 
@@ -3767,6 +5313,33 @@ def get_export_history(limit: int = 100) -> list[dict[str, Any]]:
         ).fetchall()
 
     return [dict(row) for row in rows]
+
+
+@app.get("/api/v1/reports/marketing-signups")
+def get_marketing_signups_report(limit: int = 200) -> dict[str, Any]:
+    safe_limit = min(max(limit, 1), 1000)
+
+    with closing(get_conn()) as conn:
+        rows = conn.execute(
+            """
+            SELECT id,
+                   name,
+                   email,
+                   provider,
+                   source,
+                   created_at,
+                   updated_at
+            FROM marketing_signups
+            ORDER BY updated_at DESC, id DESC
+            LIMIT ?
+            """,
+            (safe_limit,),
+        ).fetchall()
+
+    return {
+        "count": len(rows),
+        "rows": [dict(row) for row in rows],
+    }
 
 
 @app.post("/api/v1/reports/verify-export")

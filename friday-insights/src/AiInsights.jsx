@@ -15,15 +15,20 @@ import {
   Handshake,
   Layers,
   Loader2,
+  Mic,
   PanelLeft,
   Radar,
+  Send,
   Smartphone,
   Sparkles,
   ShieldAlert,
+  Upload,
+  UserPlus,
   Zap,
 } from "lucide-react";
 import { AnimatePresence, motion } from "framer-motion";
 import "./AiInsights.css";
+import NexusGraph from "./NexusGraph";
 
 function formatINR(value) {
   const num = Number(value ?? 0);
@@ -203,6 +208,24 @@ export default function AiInsights() {
   const [telemetry, setTelemetry] = useState(null);
   const [forensicStreamText, setForensicStreamText] = useState("");
   const [deckMode, setDeckMode] = useState(false);
+  const [omniResult, setOmniResult] = useState(null);
+  const [omniError, setOmniError] = useState("");
+  const [isOmniUploading, setIsOmniUploading] = useState(false);
+  const [voiceResult, setVoiceResult] = useState(null);
+  const [voiceError, setVoiceError] = useState("");
+  const [isVoiceUploading, setIsVoiceUploading] = useState(false);
+  const [reconcileResult, setReconcileResult] = useState(null);
+  const [reconcileError, setReconcileError] = useState("");
+  const [isReconciling2b, setIsReconciling2b] = useState(false);
+  const [nexusGraphData, setNexusGraphData] = useState(null);
+  const [isNudgingGhost, setIsNudgingGhost] = useState({});
+  const [selectedRiskNode, setSelectedRiskNode] = useState(null);
+  const [riskNudgePhone, setRiskNudgePhone] = useState("");
+  const [m3PulseHistory, setM3PulseHistory] = useState([]);
+  const [caInviteEmail, setCaInviteEmail] = useState("");
+  const [isInvitingCa, setIsInvitingCa] = useState(false);
+  const [caInviteResult, setCaInviteResult] = useState(null);
+  const [caInviteError, setCaInviteError] = useState("");
 
   useEffect(() => {
     if (!fridayAnswer) {
@@ -245,9 +268,37 @@ export default function AiInsights() {
       const data = await res.json();
       if (res.ok) {
         setTelemetry(data);
+        setM3PulseHistory((prev) => {
+          const next = [
+            ...prev,
+            {
+              ts: Date.now(),
+              cpu: Number(data?.cpu_percent || 0),
+              workers: Number(data?.active_workers || 0),
+            },
+          ];
+          return next.slice(-40);
+        });
       }
     } catch {
       // keep last known telemetry snapshot
+    }
+  };
+
+  const refreshNexusGraph = async () => {
+    try {
+      const res = await fetch("/api/v1/ledger/nexus-graph/latest", {
+        headers: {
+          "X-Role": adminRole,
+          "X-Admin-Id": adminId,
+        },
+      });
+      const data = await res.json();
+      if (res.ok) {
+        setNexusGraphData(data);
+      }
+    } catch {
+      // graph may not exist yet
     }
   };
 
@@ -314,6 +365,271 @@ export default function AiInsights() {
       setNeuralInkError(err instanceof Error ? err.message : "Failed to run Neural-Ink");
     } finally {
       setIsNeuralInking(false);
+    }
+  };
+
+  const uploadOmniIngest = async (incoming) => {
+    const files = Array.isArray(incoming)
+      ? incoming
+      : incoming instanceof FileList
+        ? Array.from(incoming)
+        : incoming
+          ? [incoming]
+          : [];
+
+    if (files.length === 0) {
+      return;
+    }
+    setIsOmniUploading(true);
+    setOmniError("");
+    setOmniResult(null);
+    try {
+      const formData = new FormData();
+      const endpoint = files.length > 1 ? "/api/v1/ledger/ingest-batch" : "/api/v1/ledger/ingest";
+      if (files.length > 1) {
+        files.forEach((file) => formData.append("files", file));
+      } else {
+        formData.append("file", files[0]);
+      }
+
+      const res = await fetch(endpoint, {
+        method: "POST",
+        headers: {
+          "X-Role": adminRole,
+          "X-Admin-Id": adminId,
+        },
+        body: formData,
+      });
+      const data = await res.json();
+      if (!res.ok) {
+        throw new Error(data?.detail || `Omni ingest failed (${res.status})`);
+      }
+      setOmniResult(data);
+      if (files.length > 1) {
+        setWizardResult(`Omni mixed-batch posted ${data.posted_entries ?? 0}/${data.submitted ?? files.length} file(s).`);
+      } else {
+        setWizardResult(`Omni-Reader posted ${data.entries_created} entry(s) from ${files[0].name}.`);
+      }
+      await fetchSummary();
+    } catch (err) {
+      setOmniError(err instanceof Error ? err.message : "Failed Omni ingestion");
+    } finally {
+      setIsOmniUploading(false);
+    }
+  };
+
+  const uploadVoiceCommand = async (file) => {
+    if (!file) {
+      return;
+    }
+    setIsVoiceUploading(true);
+    setVoiceError("");
+    setVoiceResult(null);
+    try {
+      const formData = new FormData();
+      formData.append("file", file);
+      const res = await fetch("/api/v1/ledger/voice-cmd", {
+        method: "POST",
+        headers: {
+          "X-Role": adminRole,
+          "X-Admin-Id": adminId,
+        },
+        body: formData,
+      });
+      const data = await res.json();
+      if (!res.ok) {
+        throw new Error(data?.detail || `Voice command failed (${res.status})`);
+      }
+      setVoiceResult(data);
+      setWizardResult(`Voice voucher posted as ${data.reference}.`);
+      await fetchSummary();
+    } catch (err) {
+      setVoiceError(err instanceof Error ? err.message : "Failed voice command ingestion");
+    } finally {
+      setIsVoiceUploading(false);
+    }
+  };
+
+  const upload2bReconciliation = async (file) => {
+    if (!file) {
+      return;
+    }
+    setIsReconciling2b(true);
+    setReconcileError("");
+    setReconcileResult(null);
+    try {
+      const formData = new FormData();
+      formData.append("file", file);
+      const res = await fetch("/api/v1/ledger/reconcile-2b", {
+        method: "POST",
+        headers: {
+          "X-Role": adminRole,
+          "X-Admin-Id": adminId,
+        },
+        body: formData,
+      });
+      const data = await res.json();
+      if (!res.ok) {
+        throw new Error(data?.detail || `2B reconciliation failed (${res.status})`);
+      }
+      setReconcileResult(data);
+      setNexusGraphData(data.nexus_graph || null);
+      setWizardResult(`2B reconciliation complete: ${data.ghost_invoices_count} ghost invoice(s) detected.`);
+      await fetchSummary();
+    } catch (err) {
+      setReconcileError(err instanceof Error ? err.message : "Failed 2B reconciliation");
+    } finally {
+      setIsReconciling2b(false);
+    }
+  };
+
+  const sendGhostNudge = async (item) => {
+    const key = `${item.entry_id}`;
+    setIsNudgingGhost((prev) => ({ ...prev, [key]: true }));
+    try {
+      const res = await fetch("/api/v1/ledger/nudge-vendor", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "X-Role": adminRole,
+          "X-Admin-Id": adminId,
+        },
+        body: JSON.stringify({
+          gstin: item.gstin,
+          vendor_name: item.vendor_name,
+          invoice_reference: item.reference,
+          invoice_amount: item.taxable_value,
+          mismatch_reason: "Invoice missing from uploaded GSTR-2B",
+        }),
+      });
+      const data = await res.json();
+      if (!res.ok) {
+        throw new Error(data?.detail || `Nudge generation failed (${res.status})`);
+      }
+      const message = data?.whatsapp_message || "Nudge generated.";
+      setReconcileResult((prev) => {
+        if (!prev?.ghost_invoices) {
+          return prev;
+        }
+        return {
+          ...prev,
+          ghost_invoices: prev.ghost_invoices.map((row) =>
+            row.entry_id === item.entry_id
+              ? {
+                  ...row,
+                  nudge_template: {
+                    ...(row.nudge_template || {}),
+                    message,
+                    urgency: data?.urgency || row?.nudge_template?.urgency,
+                  },
+                }
+              : row
+          ),
+        };
+      });
+    } catch (err) {
+      setReconcileError(err instanceof Error ? err.message : "Failed to nudge vendor");
+    } finally {
+      setIsNudgingGhost((prev) => ({ ...prev, [key]: false }));
+    }
+  };
+
+  const sendRiskNodeNudge = async () => {
+    if (!selectedRiskNode?.id) {
+      return;
+    }
+
+    const gstinCandidate = String(selectedRiskNode.id || "").trim().toUpperCase();
+    if (!/^[0-9A-Z]{15}$/.test(gstinCandidate)) {
+      setReconcileError("Selected risk node is not a valid GSTIN vendor node.");
+      return;
+    }
+
+    const key = `risk-${gstinCandidate}`;
+    setIsNudgingGhost((prev) => ({ ...prev, [key]: true }));
+    try {
+      const matchedGhost = (reconcileResult?.ghost_invoices || []).find((row) => String(row?.gstin || "").toUpperCase() === gstinCandidate);
+      const res = await fetch("/api/v1/ledger/nudge-vendor", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "X-Role": adminRole,
+          "X-Admin-Id": adminId,
+        },
+        body: JSON.stringify({
+          gstin: gstinCandidate,
+          vendor_name: matchedGhost?.vendor_name || selectedRiskNode?.id,
+          invoice_reference: matchedGhost?.reference,
+          invoice_amount: matchedGhost?.taxable_value,
+          phone_number: riskNudgePhone.trim() || undefined,
+          mismatch_reason: "Selected as high-risk from Nexus force graph",
+        }),
+      });
+      const data = await res.json();
+      if (!res.ok) {
+        throw new Error(data?.detail || `Risk-node nudge failed (${res.status})`);
+      }
+
+      setSelectedRiskNode((prev) => {
+        if (!prev) {
+          return prev;
+        }
+        return {
+          ...prev,
+          urgency: data?.urgency || "HIGH",
+          last_message: data?.whatsapp_message || "",
+        };
+      });
+      setWizardResult(`Risk-node nudge generated for ${gstinCandidate}.`);
+      if (riskNudgePhone.trim()) {
+        setWizardResult(`Risk-node nudge dispatched for ${gstinCandidate} via WhatsApp channel.`);
+      }
+    } catch (err) {
+      setReconcileError(err instanceof Error ? err.message : "Failed risk-node nudge");
+    } finally {
+      setIsNudgingGhost((prev) => ({ ...prev, [key]: false }));
+    }
+  };
+
+  const ghostInvoices = useMemo(() => {
+    const all = reconcileResult?.ghost_invoices || [];
+    if (!selectedRiskNode?.id) {
+      return all;
+    }
+    const selected = String(selectedRiskNode.id).toUpperCase();
+    const filtered = all.filter((item) => String(item?.gstin || "").toUpperCase() === selected);
+    return filtered.length > 0 ? filtered : all;
+  }, [reconcileResult, selectedRiskNode]);
+
+  const inviteCaOnboard = async () => {
+    const email = caInviteEmail.trim().toLowerCase();
+    if (!email) {
+      setCaInviteError("Enter CA email to send invite.");
+      return;
+    }
+
+    setIsInvitingCa(true);
+    setCaInviteError("");
+    setCaInviteResult(null);
+    try {
+      const query = new URLSearchParams({ email }).toString();
+      const res = await fetch(`/api/v1/ca/invite?${query}`, {
+        method: "POST",
+        headers: {
+          "X-Role": "admin",
+          "X-Admin-Id": adminId,
+        },
+      });
+      const data = await res.json();
+      if (!res.ok) {
+        throw new Error(data?.detail || `CA invite failed (${res.status})`);
+      }
+      setCaInviteResult(data);
+      setWizardResult(`CA invite issued for ${data.email}. SMTP: ${data?.email_delivery?.status || "unknown"}.`);
+    } catch (err) {
+      setCaInviteError(err instanceof Error ? err.message : "Failed to send CA invite");
+    } finally {
+      setIsInvitingCa(false);
     }
   };
 
@@ -442,6 +758,7 @@ export default function AiInsights() {
     void refreshModelHealth();
     void fetchForensicAudit();
     void fetchTelemetry();
+    void refreshNexusGraph();
     const timer = setInterval(() => {
       void fetchTelemetry();
     }, 2000);
@@ -958,6 +1275,22 @@ export default function AiInsights() {
     };
   }, [summary, topVendors, forensicAudit, telemetry]);
 
+  const pulsePoints = useMemo(() => {
+    if (m3PulseHistory.length === 0) {
+      return "";
+    }
+    const width = 560;
+    const height = 88;
+    return m3PulseHistory
+      .map((point, index) => {
+        const x = (index / Math.max(m3PulseHistory.length - 1, 1)) * width;
+        const load = Math.max(0, Math.min(100, (point.cpu * 0.8) + ((point.workers / 10) * 20)));
+        const y = height - (load / 100) * height;
+        return `${x},${y}`;
+      })
+      .join(" ");
+  }, [m3PulseHistory]);
+
   return (
     <div className="ai-shell min-h-screen bg-black text-white">
       <div className="mx-auto max-w-[96rem] px-4 sm:px-6 lg:px-8 py-8">
@@ -1001,6 +1334,34 @@ export default function AiInsights() {
               >
                 {isMintingBiometric ? "Minting..." : "Mint Biometric Token"}
               </button>
+            </div>
+
+            <div className="rounded-xl border border-slate-700/80 bg-slate-950/70 p-3 space-y-2">
+              <div className="flex items-center gap-2">
+                <UserPlus className="w-4 h-4 text-cyan-300" />
+                <p className="text-xs font-semibold text-slate-200">CA Network Onboarding</p>
+              </div>
+              <input
+                value={caInviteEmail}
+                onChange={(e) => setCaInviteEmail(e.target.value)}
+                placeholder="chartered.accountant@firm.in"
+                className="w-full rounded-lg border border-slate-700 bg-slate-950 px-3 py-2 text-xs"
+              />
+              <button
+                onClick={inviteCaOnboard}
+                disabled={isInvitingCa}
+                className="w-full inline-flex items-center justify-center gap-2 rounded-lg border border-cyan-700/70 bg-cyan-900/35 hover:bg-cyan-800/50 px-3 py-2 text-xs font-semibold disabled:opacity-60"
+              >
+                <Send className="w-3.5 h-3.5" />
+                {isInvitingCa ? "Sending Invite..." : "Send CA Invite"}
+              </button>
+              {caInviteError ? <p className="text-[11px] text-red-300">{caInviteError}</p> : null}
+              {caInviteResult ? (
+                <div className="rounded-lg border border-cyan-700/40 bg-slate-950/70 px-3 py-2 space-y-1">
+                  <p className="text-[11px] text-cyan-200 font-semibold">Invite: {caInviteResult.email}</p>
+                  <p className="text-[10px] text-slate-400">SMTP: {caInviteResult?.email_delivery?.status || "unknown"}</p>
+                </div>
+              ) : null}
             </div>
 
             <div className="rounded-xl border border-slate-700/80 bg-slate-950/70 p-3 space-y-2">
@@ -1300,6 +1661,205 @@ export default function AiInsights() {
                   </div>
                 </motion.div>
               ))}
+            </div>
+          </div>
+        </section>
+
+        <section className="grid grid-cols-1 xl:grid-cols-2 gap-6 ai-panel ai-reveal" data-delay="2">
+          <div className="rounded-2xl border border-cyan-500/35 bg-black/75 p-5 space-y-4">
+            <div className="flex items-center justify-between gap-3">
+              <div>
+                <p className="text-xs tracking-[0.22em] uppercase text-cyan-300">Omni Ingest Command</p>
+                <h3 className="text-lg font-semibold mt-1">Drop Any Format</h3>
+              </div>
+              <Upload className="w-5 h-5 text-cyan-300" />
+            </div>
+
+            <label
+              className="block rounded-xl border border-dashed border-cyan-500/60 bg-slate-950/65 px-4 py-7 text-center cursor-pointer hover:bg-slate-900/70"
+              onDragOver={(event) => {
+                event.preventDefault();
+              }}
+              onDrop={(event) => {
+                event.preventDefault();
+                const dropped = event.dataTransfer.files?.[0];
+                void uploadOmniIngest(dropped);
+              }}
+            >
+              <p className="text-sm text-cyan-100 font-semibold">Omni-Drop Zone</p>
+              <p className="text-xs text-slate-400 mt-1">Excel, PDF, JPEG, PNG, video. Drop or click to ingest.</p>
+              <input
+                type="file"
+                accept=".xlsx,.xls,.csv,.pdf,.png,.jpg,.jpeg,.webp,.mp4,.mov,.avi,.mkv,.m4v"
+                multiple
+                className="hidden"
+                onChange={(event) => {
+                  const picked = event.target.files;
+                  void uploadOmniIngest(picked);
+                  event.target.value = "";
+                }}
+              />
+            </label>
+
+            <div className="rounded-lg border border-cyan-900/60 bg-slate-950/80 p-3">
+              <div className="flex items-center justify-between gap-3 mb-2">
+                <p className="text-[11px] text-cyan-200 uppercase tracking-[0.18em]">M3 Pulse</p>
+                <span className="text-[11px] text-slate-400">CPU {Math.round(Number(telemetry?.cpu_percent || 0))}%</span>
+              </div>
+              <svg viewBox="0 0 560 88" className="w-full h-20">
+                <rect x="0" y="0" width="560" height="88" fill="rgba(2,6,23,0.6)" />
+                {pulsePoints ? (
+                  <polyline
+                    points={pulsePoints}
+                    fill="none"
+                    stroke="#22d3ee"
+                    strokeWidth="2.5"
+                    strokeLinecap="round"
+                    strokeLinejoin="round"
+                  />
+                ) : null}
+              </svg>
+            </div>
+
+            {isOmniUploading ? <p className="text-xs text-cyan-200">Ingesting with Omni-Reader...</p> : null}
+            {omniError ? <p className="text-xs text-red-300">{omniError}</p> : null}
+            {omniResult ? (
+              <div className="rounded-lg border border-emerald-700/45 bg-emerald-900/20 p-3 text-xs text-emerald-100">
+                {omniResult.worker_model
+                  ? `Mode: ${omniResult.engine} | Posted: ${omniResult.posted_entries}/${omniResult.submitted}`
+                  : `Pipeline: ${omniResult.pipeline} | Entries: ${omniResult.entries_created}`}
+              </div>
+            ) : null}
+
+            <div className="rounded-xl border border-indigo-700/55 bg-indigo-950/25 p-3 space-y-2">
+              <div className="flex items-center gap-2">
+                <Mic className="w-4 h-4 text-indigo-300" />
+                <p className="text-xs font-semibold text-indigo-100">Voice-to-Ledger</p>
+              </div>
+              <label className="w-full inline-flex items-center justify-center gap-2 rounded-lg border border-indigo-700/70 bg-indigo-900/35 hover:bg-indigo-800/45 px-3 py-2 text-xs font-semibold cursor-pointer">
+                {isVoiceUploading ? "Transcribing..." : "Upload Voice Command"}
+                <input
+                  type="file"
+                  accept="audio/*,.wav,.mp3,.m4a,.aac,.ogg"
+                  className="hidden"
+                  onChange={(event) => {
+                    const picked = event.target.files?.[0];
+                    void uploadVoiceCommand(picked);
+                    event.target.value = "";
+                  }}
+                />
+              </label>
+              {voiceError ? <p className="text-[11px] text-red-300">{voiceError}</p> : null}
+              {voiceResult ? (
+                <div className="rounded-lg border border-indigo-700/50 bg-slate-950/70 p-2 text-[11px] text-slate-300">
+                  <p className="text-indigo-200 font-semibold">{voiceResult.reference} | INR {voiceResult.parsed_voucher?.amount}</p>
+                  <p className="mt-1">{voiceResult.transcript}</p>
+                </div>
+              ) : null}
+            </div>
+          </div>
+
+          <div className="rounded-2xl border border-red-500/30 bg-black/75 p-5 space-y-4">
+            <div className="flex items-center justify-between gap-3">
+              <div>
+                <p className="text-xs tracking-[0.22em] uppercase text-red-300">GSTR-2B Anomaly Radar</p>
+                <h3 className="text-lg font-semibold mt-1">Ghost Invoice Detection</h3>
+              </div>
+              <Radar className="w-5 h-5 text-red-300" />
+            </div>
+
+            <label className="w-full inline-flex items-center justify-center gap-2 rounded-lg border border-red-700/65 bg-red-900/25 hover:bg-red-800/30 px-3 py-2 text-xs font-semibold cursor-pointer">
+              {isReconciling2b ? "Reconciling..." : "Upload 2B JSON/Excel"}
+              <input
+                type="file"
+                accept=".json,.xlsx,.xls,.csv"
+                className="hidden"
+                onChange={(event) => {
+                  const picked = event.target.files?.[0];
+                  void upload2bReconciliation(picked);
+                  event.target.value = "";
+                }}
+              />
+            </label>
+
+            {reconcileError ? <p className="text-xs text-red-300">{reconcileError}</p> : null}
+            {reconcileResult ? (
+              <div className="rounded-lg border border-red-700/45 bg-red-950/25 p-3 space-y-2">
+                <p className="text-xs text-red-100 font-semibold">
+                  Ghost Invoices: {reconcileResult.ghost_invoices_count} | Ledger Rows: {reconcileResult.ledger_records}
+                </p>
+                {selectedRiskNode?.id ? (
+                  <p className="text-[11px] text-cyan-200">Radar focus: {selectedRiskNode.id}</p>
+                ) : null}
+                <div className="space-y-2 max-h-48 overflow-y-auto">
+                  {ghostInvoices.slice(0, 12).map((item) => (
+                    <div key={`ghost-${item.entry_id}`} className="rounded-lg border border-red-800/50 bg-slate-950/70 px-3 py-2">
+                      <p className="text-[11px] text-red-200 font-semibold">{item.reference} | {item.gstin}</p>
+                      <p className="text-[11px] text-slate-400">{item.vendor_name} | Tax {formatINR(item.tax_amount)}</p>
+                      <div className="mt-1 flex items-center justify-between gap-3">
+                        <span className="text-[10px] text-slate-500 truncate">{item.nudge_template?.message || "No nudge generated"}</span>
+                        <button
+                          onClick={() => {
+                            void sendGhostNudge(item);
+                          }}
+                          disabled={Boolean(isNudgingGhost[`${item.entry_id}`])}
+                          className="text-[10px] px-2 py-1 rounded border border-cyan-700/70 bg-cyan-900/35 hover:bg-cyan-800/50 text-cyan-100 disabled:opacity-60"
+                        >
+                          {isNudgingGhost[`${item.entry_id}`] ? "Generating..." : "WhatsApp Nudge"}
+                        </button>
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              </div>
+            ) : null}
+
+            <div className="flex items-center justify-between">
+              <p className="text-xs text-slate-400">Nexus Graph Intelligence</p>
+              <button
+                onClick={refreshNexusGraph}
+                className="text-[11px] px-2.5 py-1 rounded border border-slate-700 bg-slate-900 hover:bg-slate-800 text-slate-200"
+              >
+                Refresh Graph
+              </button>
+            </div>
+            <NexusGraph
+              graph={nexusGraphData}
+              onRiskNodeSelect={(node) => {
+                setSelectedRiskNode(node);
+              }}
+            />
+
+            <div className="rounded-xl border border-cyan-700/45 bg-cyan-900/15 px-3 py-3">
+              <p className="text-xs uppercase tracking-[0.16em] text-cyan-200">Auto Nudge From Nexus Node</p>
+              {selectedRiskNode ? (
+                <div className="mt-2 space-y-2">
+                  <p className="text-xs text-slate-300">
+                    Selected Node: <span className="text-cyan-100 font-semibold">{selectedRiskNode.id}</span>
+                    {selectedRiskNode.urgency ? <span className="ml-2 text-amber-300">Urgency: {selectedRiskNode.urgency}</span> : null}
+                  </p>
+                  <input
+                    value={riskNudgePhone}
+                    onChange={(event) => setRiskNudgePhone(event.target.value)}
+                    placeholder="Vendor WhatsApp number (+91...) optional"
+                    className="w-full rounded border border-slate-700 bg-slate-950 px-2.5 py-1.5 text-xs text-slate-100"
+                  />
+                  <button
+                    onClick={() => {
+                      void sendRiskNodeNudge();
+                    }}
+                    disabled={Boolean(isNudgingGhost[`risk-${String(selectedRiskNode.id).toUpperCase()}`])}
+                    className="text-xs px-3 py-1.5 rounded border border-cyan-600/70 bg-cyan-900/35 hover:bg-cyan-800/45 text-cyan-100 disabled:opacity-60"
+                  >
+                    {isNudgingGhost[`risk-${String(selectedRiskNode.id).toUpperCase()}`] ? "Generating..." : "Generate Node Nudge"}
+                  </button>
+                  {selectedRiskNode.last_message ? (
+                    <p className="text-[11px] text-slate-400 truncate">{selectedRiskNode.last_message}</p>
+                  ) : null}
+                </div>
+              ) : (
+                <p className="mt-2 text-xs text-slate-400">Click a red node in Nexus graph to activate targeted nudge generation.</p>
+              )}
             </div>
           </div>
         </section>

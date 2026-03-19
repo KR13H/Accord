@@ -7,6 +7,8 @@ import Ledger from "./Ledger";
 import CaDashboard from "./CaDashboard";
 import CaAccept from "./CaAccept";
 import Pricing from "./Pricing";
+import Signup from "./Signup";
+import ReportsCenter from "./ReportsCenter";
 
 const NAV_ITEMS = [
   { to: "/", label: "Home" },
@@ -14,6 +16,8 @@ const NAV_ITEMS = [
   { to: "/dashboard", label: "Dashboard" },
   { to: "/ledger", label: "Ledger" },
   { to: "/insights", label: "Friday" },
+  { to: "/reports", label: "Reports" },
+  { to: "/signup", label: "Signup" },
   { to: "/ca/dashboard", label: "CA" },
 ];
 
@@ -78,12 +82,12 @@ function BottomDock() {
 function App() {
   return (
     <BrowserRouter>
-      <div className="min-h-screen bg-[#020617] text-slate-100 flex flex-col">
+      <div className="min-h-screen bg-black text-white flex flex-col">
         <div
           className="fixed inset-0 pointer-events-none"
           style={{
             background:
-              "radial-gradient(1100px 500px at 15% -10%, rgba(34,211,238,0.18), transparent 45%), radial-gradient(900px 460px at 90% 0%, rgba(16,185,129,0.12), transparent 40%)",
+              "radial-gradient(1100px 500px at 15% -10%, rgba(34,211,238,0.16), transparent 45%), radial-gradient(900px 460px at 90% 0%, rgba(255,255,255,0.08), transparent 40%)",
             willChange: "transform",
             transform: "translateZ(0)",
           }}
@@ -96,6 +100,8 @@ function App() {
             <Route path="/dashboard" element={<Dashboard />} />
             <Route path="/ledger" element={<Ledger />} />
             <Route path="/insights" element={<AiInsights />} />
+            <Route path="/reports" element={<ReportsCenter />} />
+            <Route path="/signup" element={<Signup />} />
             <Route path="/ca/dashboard" element={<CaDashboard />} />
             <Route path="/ca/accept/:token" element={<CaAccept />} />
             <Route path="*" element={<Navigate to="/" replace />} />
