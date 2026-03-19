@@ -6,7 +6,7 @@
 # Workloads: Parallel ingestion, Mistral forensic audit, CPU saturation pulse
 ################################################################################
 
-set -e
+set -euo pipefail
 
 ACCORD_ROOT="/Users/krish/Developer/Accord"
 BACKEND_URL="http://localhost:8000"
@@ -20,9 +20,14 @@ YELLOW='\033[1;33m'
 CYAN='\033[0;36m'
 NC='\033[0m' # No Color
 
-echo -e "${CYAN}════════════════════════════════════════════════════════════${NC}"
-echo -e "${CYAN}  🚀 ACCORD M3 BURN-IN SUPREMACY SUITE${NC}"
-echo -e "${CYAN}════════════════════════════════════════════════════════════${NC}"
+if ! command -v jq >/dev/null 2>&1; then
+    echo -e "${RED}ERROR: jq is required for telemetry rendering. Install with: brew install jq${NC}"
+    exit 1
+fi
+
+echo -e "${CYAN}============================================================${NC}"
+echo -e "${CYAN}  ACCORD M3 BURN-IN SUPREMACY SUITE${NC}"
+echo -e "${CYAN}============================================================${NC}"
 echo ""
 
 # ============================================================================
@@ -30,11 +35,11 @@ echo ""
 # ============================================================================
 echo -e "${YELLOW}[PHASE 1] Backend Communication Check${NC}"
 if ! curl -s "$BACKEND_URL/api/v1/health" > /dev/null 2>&1; then
-    echo -e "${RED}❌ Backend not running at $BACKEND_URL${NC}"
+    echo -e "${RED}FAIL Backend not running at $BACKEND_URL${NC}"
     echo "   Start backend with: uvicorn cloud_backend.main:app --reload --port 8000"
     exit 1
 fi
-echo -e "${GREEN}✅ Backend responsive at $BACKEND_URL${NC}"
+echo -e "${GREEN}OK Backend responsive at $BACKEND_URL${NC}"
 echo ""
 
 # ============================================================================
@@ -43,7 +48,7 @@ echo ""
 echo -e "${YELLOW}[PHASE 2] Triggering M3 Saturation Pulse (2-sec CPU burn)${NC}"
 PULSE_RESPONSE=$(curl -s -X GET "$BACKEND_URL/api/v1/system/saturation-pulse")
 echo "$PULSE_RESPONSE" | jq .
-echo -e "${GREEN}✅ Saturation pulse complete${NC}"
+echo -e "${GREEN}OK Saturation pulse complete${NC}"
 echo ""
 
 # ============================================================================
@@ -54,7 +59,7 @@ echo "         (Each request targets adaptive ingest worker pool)"
 echo ""
 
 if [ ! -f "$SAMPLE_FILE" ]; then
-    echo -e "${RED}❌ Sample file not found: $SAMPLE_FILE${NC}"
+    echo -e "${RED}FAIL Sample file not found: $SAMPLE_FILE${NC}"
     echo "   Skipping ingestion phase."
 else
     INGEST_START=$(date +%s%N)
@@ -62,13 +67,16 @@ else
     
     for i in {1..20}; do
         (
-            ADMIN_ID="SUPREMACY_BOT_${i}"
-            curl -s -X POST "$BACKEND_URL/api/v1/ledger/ingest-batch" \
+            ADMIN_ID=$((1000 + i))
+            HTTP_CODE=$(curl -s -o "/tmp/ingest_$i.json" -w "%{http_code}" -X POST "$BACKEND_URL/api/v1/ledger/ingest-batch" \
                  -H "X-Role: admin" \
                  -H "X-Admin-Id: $ADMIN_ID" \
-                 -F "files=@$SAMPLE_FILE" \
-                 > "/tmp/ingest_$i.json" 2>&1
-            echo -e "${GREEN}[Ingest $i] Complete${NC}"
+                 -F "files=@$SAMPLE_FILE")
+            if [ "$HTTP_CODE" = "200" ]; then
+                echo -e "${GREEN}[Ingest $i] OK (HTTP $HTTP_CODE)${NC}"
+            else
+                echo -e "${RED}[Ingest $i] FAIL (HTTP $HTTP_CODE)${NC}"
+            fi
         ) &
         INGEST_PIDS+=($!)
         
@@ -84,7 +92,7 @@ else
     
     INGEST_END=$(date +%s%N)
     INGEST_DURATION=$(( (INGEST_END - INGEST_START) / 1000000 ))
-    echo -e "${GREEN}✅ All 20 ingestion requests completed in ${INGEST_DURATION}ms${NC}"
+    echo -e "${GREEN}OK All 20 ingestion requests completed in ${INGEST_DURATION}ms${NC}"
     
     # Sample a few responses
     echo -e "${CYAN}Sample response (Ingest #1):${NC}"
@@ -113,7 +121,7 @@ for i in {1..15}; do
     
     sleep 1
 done
-echo -e "${GREEN}✅ Telemetry monitoring complete${NC}"
+echo -e "${GREEN}OK Telemetry monitoring complete${NC}"
 echo ""
 
 # ============================================================================
@@ -123,20 +131,20 @@ echo -e "${YELLOW}[PHASE 5] Optional: Mistral Forensic Audit (Background)${NC}"
 echo "         Launch with: ollama run mistral \"Analyze tax compliance for 10,000 entries\""
 echo "         (Runs in background; does not block test suite)"
 echo ""
-echo -e "${GREEN}✅ Test suite ready for Mistral deep-scan${NC}"
+echo -e "${GREEN}OK Test suite ready for Mistral deep-scan${NC}"
 echo ""
 
 # ============================================================================
 # PHASE 6: RESULTS SUMMARY
 # ============================================================================
-echo -e "${CYAN}════════════════════════════════════════════════════════════${NC}"
-echo -e "${CYAN}  🎯 M3 BURN-IN SUMMARY${NC}"
-echo -e "${CYAN}════════════════════════════════════════════════════════════${NC}"
+echo -e "${CYAN}============================================================${NC}"
+echo -e "${CYAN}  M3 BURN-IN SUMMARY${NC}"
+echo -e "${CYAN}============================================================${NC}"
 echo ""
 echo -e "${GREEN}Workloads Executed:${NC}"
-echo "  ✓ CPU saturation pulse (2 seconds)"
-echo "  ✓ 20 parallel ingestion requests"
-echo "  ✓ 15-second telemetry sampling"
+echo "  - CPU saturation pulse (2 seconds)"
+echo "  - 20 parallel ingestion requests"
+echo "  - 15-second telemetry sampling"
 echo ""
 echo -e "${CYAN}Next Steps:${NC}"
 echo "  1. Check cloud-backend logs for adaptive worker scaling"
@@ -144,4 +152,4 @@ echo "  2. Verify chain-of-trust integrity: curl -s http://localhost:8000/api/v1
 echo "  3. Optional: Run Mistral forensic audit in background"
 echo "  4. Commit results: git add -A && git commit -m 'BURN-IN: M3 stress test complete'"
 echo ""
-echo -e "${GREEN}🔥 M3 SUPREMACY SUITE COMPLETE 🔥${NC}"
+echo -e "${GREEN}M3 SUPREMACY SUITE COMPLETE${NC}"
