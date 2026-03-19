@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import sqlite3
 import base64
 import csv
@@ -23,9 +24,9 @@ import xml.etree.ElementTree as ET
 from concurrent.futures import ProcessPoolExecutor
 from email.message import EmailMessage
 
-from fastapi import FastAPI, File, Header, HTTPException, UploadFile
+from fastapi import FastAPI, File, Header, HTTPException, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import Response
+from fastapi.responses import JSONResponse, Response
 import httpx
 from pydantic import BaseModel, Field
 from reportlab.lib.pagesizes import A4
@@ -136,6 +137,9 @@ except Exception:  # noqa: BLE001
     psutil = None
 
 WHISPER_MODEL_CACHE: Any | None = None
+INGEST_RETRY_BUCKETS: dict[str, dict[str, Any]] = {}
+LATENCY_WARN_THRESHOLD_MS = 3000
+api_logger = logging.getLogger("accord.api")
 
 # Keep UQC values constrained to GSTN-style codes; alias map handles common user inputs.
 ALLOWED_UQC = {
@@ -1271,27 +1275,60 @@ def _extract_batch_candidate_worker(file_path_str: str, file_name: str, content_
 
 
 class AdaptiveIngest:
+    """Adaptive ingest orchestrator tuned for M3 thermal and memory headroom.
+
+    Worker count scales with CPU and available unified memory, and a circuit
+    breaker pauses the queue if sustained saturation is detected.
+    """
+
     def __init__(self, max_workers: int = 12, min_workers: int = 4):
         self.max_workers = max_workers
         self.min_workers = min_workers
         self.retry_bucket: list[dict[str, str]] = []
         self.last_cpu_load = 0.0
+        self.last_memory_available_gb = 0.0
+        self.circuit_breaker_open = False
+        self.saturation_alert = ""
+
+    def _sample_cpu_window(self) -> list[float]:
+        if psutil is None:
+            return [0.0]
+        samples: list[float] = []
+        for _ in range(5):
+            try:
+                samples.append(float(psutil.cpu_percent(interval=1.0)))
+            except Exception:  # noqa: BLE001
+                samples.append(50.0)
+        return samples
 
     def get_optimal_workers(self) -> int:
         # Keep the host responsive under pressure while still saturating throughput when cool.
         if psutil is None:
             self.last_cpu_load = 0.0
+            self.last_memory_available_gb = 0.0
+            self.circuit_breaker_open = False
             return min(8, self.max_workers)
 
-        try:
-            load = float(psutil.cpu_percent(interval=1.0))
-        except Exception:  # noqa: BLE001
-            load = 50.0
-        self.last_cpu_load = load
+        load_samples = self._sample_cpu_window()
+        avg_load = sum(load_samples) / max(len(load_samples), 1)
+        self.last_cpu_load = avg_load
 
-        if load > 85:
+        try:
+            vm = psutil.virtual_memory()
+            available_gb = float(vm.available) / float(1024**3)
+        except Exception:  # noqa: BLE001
+            available_gb = 4.0
+        self.last_memory_available_gb = available_gb
+
+        sustained_hot = all(sample > 90 for sample in load_samples)
+        self.circuit_breaker_open = sustained_hot
+        if sustained_hot:
+            self.saturation_alert = "CPU >90% for 5s, queue paused for thermal safety"
             return self.min_workers
-        if load < 40:
+
+        if avg_load > 85 or available_gb < 2.5:
+            return self.min_workers
+        if avg_load < 40 and available_gb > 6.0:
             return self.max_workers
         return min(max(8, self.min_workers), self.max_workers)
 
@@ -1315,6 +1352,10 @@ class AdaptiveIngest:
 
     async def process_batch(self, files: list[dict[str, str]]) -> tuple[list[dict[str, Any]], int, int]:
         initial_workers = min(self.get_optimal_workers(), len(files))
+        if self.circuit_breaker_open:
+            # Circuit breaker backoff to avoid persistent thermal throttling loops.
+            await asyncio.sleep(5)
+
         first_pass = self._run_extraction(files, workers=max(initial_workers, self.min_workers))
 
         self.retry_bucket = [
@@ -1447,6 +1488,10 @@ class MarketingSignupIn(BaseModel):
     source: str = Field(default="public-signup", min_length=2, max_length=80)
 
 
+class IngestBatchRetryIn(BaseModel):
+    batch_id: str = Field(min_length=8, max_length=64)
+
+
 app = FastAPI(title="Friday Insights Ledger API", version="1.0.0")
 
 app.add_middleware(
@@ -1456,6 +1501,60 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+@app.middleware("http")
+async def request_telemetry_middleware(request: Request, call_next):
+    request_id = uuid.uuid4().hex[:12]
+    started_at = datetime.utcnow().isoformat(timespec="seconds") + "Z"
+    start_ts = datetime.utcnow().timestamp()
+
+    response = await call_next(request)
+    elapsed_ms = (datetime.utcnow().timestamp() - start_ts) * 1000
+    response.headers["X-Request-Id"] = request_id
+
+    if elapsed_ms > LATENCY_WARN_THRESHOLD_MS:
+        api_logger.warning(
+            "Saturation warning request_id=%s method=%s path=%s latency_ms=%.1f started_at=%s",
+            request_id,
+            request.method,
+            request.url.path,
+            elapsed_ms,
+            started_at,
+        )
+    return response
+
+
+@app.exception_handler(HTTPException)
+async def http_exception_handler(_: Request, exc: HTTPException) -> JSONResponse:
+    error_id = uuid.uuid4().hex[:12]
+    return JSONResponse(
+        status_code=exc.status_code,
+        content={
+            "status": "error",
+            "error_id": error_id,
+            "detail": exc.detail,
+        },
+    )
+
+
+@app.exception_handler(Exception)
+async def global_exception_handler(request: Request, exc: Exception) -> JSONResponse:
+    error_id = uuid.uuid4().hex[:12]
+    api_logger.exception(
+        "Unhandled exception error_id=%s method=%s path=%s",
+        error_id,
+        request.method,
+        request.url.path,
+    )
+    return JSONResponse(
+        status_code=500,
+        content={
+            "status": "error",
+            "error_id": error_id,
+            "detail": "Internal server error",
+        },
+    )
 
 
 def get_conn() -> sqlite3.Connection:
@@ -3667,6 +3766,61 @@ async def omni_reader_ingest(
     }
 
 
+def _post_batch_extract_results(
+    extracted_results: list[dict[str, Any]],
+    role: str,
+    admin_id: int,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[dict[str, str]]]:
+    posted: list[dict[str, Any]] = []
+    failed: list[dict[str, Any]] = []
+    retry_candidates: list[dict[str, str]] = []
+
+    for bundle in extracted_results:
+        item = bundle["meta"]
+        result = bundle["result"]
+        source_path = Path(item["path"])
+
+        if result.get("status") != "ok":
+            failed.append(
+                {
+                    "file": item["file_name"],
+                    "reason": result.get("reason", "Unknown extraction failure"),
+                }
+            )
+            retry_candidates.append(item)
+            continue
+
+        try:
+            with closing(get_conn()) as conn:
+                entry = _post_ledger_entry_from_extract(
+                    conn=conn,
+                    extracted=result.get("extracted") or {},
+                    fallback_text=str(result.get("raw_text", "")),
+                    description_prefix=f"Omni-Mixed {result.get('pipeline', 'BATCH')}",
+                    actor_role=role,
+                    admin_id=admin_id,
+                    source_file_path=source_path,
+                    model_response="",
+                    import_status=str(result.get("pipeline", "OMNI_BATCH")),
+                )
+                conn.commit()
+                posted.append(
+                    {
+                        "file": item["file_name"],
+                        "pipeline": result.get("pipeline"),
+                        "entry": entry,
+                    }
+                )
+        except Exception as exc:  # noqa: BLE001
+            failed.append({"file": item["file_name"], "reason": str(exc)})
+            retry_candidates.append(item)
+
+        archived = PROCESSED_ARCHIVE_DIR / source_path.name
+        shutil.copy2(source_path, archived)
+
+    return posted, failed, retry_candidates
+
+
 @app.post("/api/v1/ledger/ingest-batch")
 async def omni_reader_ingest_batch(
     files: list[UploadFile] = File(...),
@@ -3708,64 +3862,74 @@ async def omni_reader_ingest_batch(
 
     adaptive_ingest = AdaptiveIngest(max_workers=12, min_workers=4)
     extracted_results, chosen_workers, retried_count = await adaptive_ingest.process_batch(saved_files)
+    posted, failed, retry_candidates = _post_batch_extract_results(extracted_results, role=role, admin_id=admin_id)
 
-    posted: list[dict[str, Any]] = []
-    failed: list[dict[str, Any]] = []
-
-    for bundle in extracted_results:
-        item = bundle["meta"]
-        result = bundle["result"]
-        source_path = Path(item["path"])
-
-        if result.get("status") != "ok":
-            failed.append(
-                {
-                    "file": item["file_name"],
-                    "reason": result.get("reason", "Unknown extraction failure"),
-                }
-            )
-            continue
-
-        try:
-            with closing(get_conn()) as conn:
-                entry = _post_ledger_entry_from_extract(
-                    conn=conn,
-                    extracted=result.get("extracted") or {},
-                    fallback_text=str(result.get("raw_text", "")),
-                    description_prefix=f"Omni-Mixed {result.get('pipeline', 'BATCH')}",
-                    actor_role=role,
-                    admin_id=admin_id,
-                    source_file_path=source_path,
-                    model_response="",
-                    import_status=str(result.get("pipeline", "OMNI_BATCH")),
-                )
-                conn.commit()
-                posted.append(
-                    {
-                        "file": item["file_name"],
-                        "pipeline": result.get("pipeline"),
-                        "entry": entry,
-                    }
-                )
-        except Exception as exc:  # noqa: BLE001
-            failed.append(
-                {
-                    "file": item["file_name"],
-                    "reason": str(exc),
-                }
-            )
-
-        archived = PROCESSED_ARCHIVE_DIR / source_path.name
-        shutil.copy2(source_path, archived)
+    batch_id = uuid.uuid4().hex[:16]
+    INGEST_RETRY_BUCKETS[batch_id] = {
+        "created_at": datetime.utcnow().isoformat(timespec="seconds") + "Z",
+        "files": retry_candidates,
+    }
 
     return {
         "status": "processed",
         "engine": "OMNI_GOD_MODE",
         "worker_model": f"ProcessPoolExecutor({chosen_workers})",
         "adaptive_cpu_load": round(adaptive_ingest.last_cpu_load, 2),
+        "adaptive_memory_available_gb": round(adaptive_ingest.last_memory_available_gb, 2),
+        "saturation_alert": adaptive_ingest.saturation_alert,
         "retry_attempted": retried_count,
         "retry_bucket_size": len(adaptive_ingest.retry_bucket),
+        "retry_batch_id": batch_id,
         "submitted": len(saved_files),
+        "posted_entries": len(posted),
+        "failed_entries": len(failed),
+        "results": posted,
+        "failures": failed,
+    }
+
+
+@app.post("/api/v1/ledger/ingest-batch/retry-failed")
+async def omni_reader_retry_failed(
+    payload: IngestBatchRetryIn,
+    x_role: str | None = Header(default=None, alias="X-Role"),
+    x_admin_id: str | None = Header(default=None, alias="X-Admin-Id"),
+) -> dict[str, Any]:
+    role = require_role(x_role, {"admin", "ca"})
+    admin_id = require_admin_id(x_admin_id)
+
+    bucket = INGEST_RETRY_BUCKETS.get(payload.batch_id)
+    if bucket is None:
+        raise HTTPException(status_code=404, detail="Retry batch not found or expired")
+
+    files = list(bucket.get("files") or [])
+    if not files:
+        return {
+            "status": "ok",
+            "message": "No failed files left in retry bucket",
+            "batch_id": payload.batch_id,
+            "posted_entries": 0,
+            "failed_entries": 0,
+            "results": [],
+            "failures": [],
+        }
+
+    adaptive_ingest = AdaptiveIngest(max_workers=12, min_workers=4)
+    extracted_results, chosen_workers, retried_count = await adaptive_ingest.process_batch(files)
+    posted, failed, retry_candidates = _post_batch_extract_results(extracted_results, role=role, admin_id=admin_id)
+
+    INGEST_RETRY_BUCKETS[payload.batch_id]["files"] = retry_candidates
+
+    return {
+        "status": "processed",
+        "batch_id": payload.batch_id,
+        "engine": "OMNI_GOD_MODE_RETRY",
+        "worker_model": f"ProcessPoolExecutor({chosen_workers})",
+        "adaptive_cpu_load": round(adaptive_ingest.last_cpu_load, 2),
+        "adaptive_memory_available_gb": round(adaptive_ingest.last_memory_available_gb, 2),
+        "saturation_alert": adaptive_ingest.saturation_alert,
+        "retry_attempted": retried_count,
+        "retry_bucket_size": len(retry_candidates),
+        "submitted": len(files),
         "posted_entries": len(posted),
         "failed_entries": len(failed),
         "results": posted,

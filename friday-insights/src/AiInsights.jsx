@@ -211,6 +211,7 @@ export default function AiInsights() {
   const [omniResult, setOmniResult] = useState(null);
   const [omniError, setOmniError] = useState("");
   const [isOmniUploading, setIsOmniUploading] = useState(false);
+  const [isRetryingOmniFailed, setIsRetryingOmniFailed] = useState(false);
   const [voiceResult, setVoiceResult] = useState(null);
   const [voiceError, setVoiceError] = useState("");
   const [isVoiceUploading, setIsVoiceUploading] = useState(false);
@@ -447,6 +448,46 @@ export default function AiInsights() {
       setVoiceError(err instanceof Error ? err.message : "Failed voice command ingestion");
     } finally {
       setIsVoiceUploading(false);
+    }
+  };
+
+  const retryFailedOmniBatch = async () => {
+    const retryBatchId = omniResult?.retry_batch_id;
+    if (!retryBatchId) {
+      return;
+    }
+    setIsRetryingOmniFailed(true);
+    setOmniError("");
+    try {
+      const res = await fetch("/api/v1/ledger/ingest-batch/retry-failed", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "X-Role": adminRole,
+          "X-Admin-Id": adminId,
+        },
+        body: JSON.stringify({ batch_id: retryBatchId }),
+      });
+      const data = await res.json();
+      if (!res.ok) {
+        throw new Error(data?.detail || `Retry failed (${res.status})`);
+      }
+
+      setOmniResult((prev) => {
+        const prevResults = Array.isArray(prev?.results) ? prev.results : [];
+        return {
+          ...(prev || {}),
+          ...data,
+          retry_batch_id: retryBatchId,
+          results: [...prevResults, ...(Array.isArray(data?.results) ? data.results : [])],
+        };
+      });
+      setWizardResult(`Retry complete: posted ${data.posted_entries}, remaining failed ${data.failed_entries}.`);
+      await fetchSummary();
+    } catch (err) {
+      setOmniError(err instanceof Error ? err.message : "Failed retry for batch files");
+    } finally {
+      setIsRetryingOmniFailed(false);
     }
   };
 
@@ -1754,10 +1795,29 @@ export default function AiInsights() {
             {isOmniUploading ? <p className="text-xs text-cyan-200">Ingesting with Omni-Reader...</p> : null}
             {omniError ? <p className="text-xs text-red-300">{omniError}</p> : null}
             {omniResult ? (
-              <div className="rounded-lg border border-emerald-700/45 bg-emerald-900/20 p-3 text-xs text-emerald-100">
-                {omniResult.worker_model
-                  ? `Mode: ${omniResult.engine} | Posted: ${omniResult.posted_entries}/${omniResult.submitted}`
-                  : `Pipeline: ${omniResult.pipeline} | Entries: ${omniResult.entries_created}`}
+              <div className="rounded-lg border border-emerald-700/45 bg-emerald-900/20 p-3 text-xs text-emerald-100 space-y-2">
+                <p>
+                  {omniResult.worker_model
+                    ? `Mode: ${omniResult.engine} | Posted: ${omniResult.posted_entries}/${omniResult.submitted}`
+                    : `Pipeline: ${omniResult.pipeline} | Entries: ${omniResult.entries_created}`}
+                </p>
+                {omniResult?.saturation_alert ? (
+                  <p className="text-amber-200">{omniResult.saturation_alert}</p>
+                ) : null}
+                {Number(omniResult?.failed_entries || 0) > 0 ? (
+                  <div className="space-y-1">
+                    <p className="text-red-200">Failed Files: {omniResult.failed_entries}</p>
+                    <button
+                      onClick={() => {
+                        void retryFailedOmniBatch();
+                      }}
+                      disabled={isRetryingOmniFailed}
+                      className="text-[11px] px-2.5 py-1 rounded border border-red-700/70 bg-red-900/30 hover:bg-red-800/45 text-red-100 disabled:opacity-60"
+                    >
+                      {isRetryingOmniFailed ? "Retrying..." : "Retry Failed"}
+                    </button>
+                  </div>
+                ) : null}
               </div>
             ) : null}
 

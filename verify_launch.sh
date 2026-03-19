@@ -38,6 +38,28 @@ fi
 mkdir -p "$RAM_DISK_BUFFER_PATH"
 ok "RAM disk buffer path ready at $RAM_DISK_BUFFER_PATH"
 
+if command -v sysctl >/dev/null 2>&1; then
+  MEM_BYTES="$(sysctl -n hw.memsize 2>/dev/null || echo 0)"
+  MEM_GB=$((MEM_BYTES / 1024 / 1024 / 1024))
+  if [[ "$MEM_GB" -ge 14 ]]; then
+    ok "Unified memory headroom check passed (${MEM_GB}GB)"
+  else
+    fail "Insufficient unified memory headroom (${MEM_GB}GB) for Llava/Mistral workloads"
+  fi
+else
+  warn "sysctl unavailable; skipped unified-memory check"
+fi
+
+if command -v system_profiler >/dev/null 2>&1; then
+  if system_profiler SPDisplaysDataType 2>/dev/null | grep -q "Metal"; then
+    ok "GPU Metal acceleration available"
+  else
+    fail "Metal acceleration unavailable; cannot guarantee model throughput"
+  fi
+else
+  warn "system_profiler unavailable; skipped GPU capability check"
+fi
+
 curl -fsS "$FRONTEND_URL" >/dev/null && ok "Frontend reachable at $FRONTEND_URL" || fail "Frontend is down"
 
 curl -fsS "$API_URL/api/v1/health" >/dev/null && ok "Backend health endpoint is up" || fail "Backend health failed"
@@ -54,6 +76,26 @@ if docker info >/dev/null 2>&1; then
     docker compose exec -T "$PG_CONTAINER" psql -U accord -d accord -c "select 1" >/dev/null 2>&1 \
       && ok "Postgres query check passed" \
       || fail "Postgres container is up but query failed"
+
+    CORE_COUNTS="$(docker compose exec -T "$PG_CONTAINER" psql -U accord -d accord -At -c "
+      SELECT 'journal_entries=' || COUNT(*) FROM journal_entries
+      UNION ALL SELECT 'journal_lines=' || COUNT(*) FROM journal_lines
+      UNION ALL SELECT 'audit_edit_logs=' || COUNT(*) FROM audit_edit_logs
+      UNION ALL SELECT 'export_history=' || COUNT(*) FROM export_history;
+    " 2>/dev/null || true)"
+    if [[ -n "$CORE_COUNTS" ]]; then
+      ok "Postgres core table counts verified"
+      echo "$CORE_COUNTS"
+    else
+      fail "Unable to read Postgres core table counts"
+    fi
+
+    LAST_HASH="$(docker compose exec -T "$PG_CONTAINER" psql -U accord -d accord -At -c "SELECT COALESCE(MAX(entry_fingerprint), '') FROM journal_entries;" 2>/dev/null || true)"
+    if [[ -n "$LAST_HASH" ]]; then
+      ok "Postgres latest audit fingerprint available"
+    else
+      warn "No journal fingerprint found yet; verify-integrity should be run after first postings"
+    fi
   else
     warn "Postgres service '$PG_CONTAINER' not found in compose"
   fi
