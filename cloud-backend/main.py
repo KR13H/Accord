@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import sqlite3
 import base64
 import csv
@@ -1267,6 +1268,73 @@ def _extract_batch_candidate_worker(file_path_str: str, file_name: str, content_
             "file": file_name,
             "reason": str(exc),
         }
+
+
+class AdaptiveIngest:
+    def __init__(self, max_workers: int = 12, min_workers: int = 4):
+        self.max_workers = max_workers
+        self.min_workers = min_workers
+        self.retry_bucket: list[dict[str, str]] = []
+        self.last_cpu_load = 0.0
+
+    def get_optimal_workers(self) -> int:
+        # Keep the host responsive under pressure while still saturating throughput when cool.
+        if psutil is None:
+            self.last_cpu_load = 0.0
+            return min(8, self.max_workers)
+
+        try:
+            load = float(psutil.cpu_percent(interval=1.0))
+        except Exception:  # noqa: BLE001
+            load = 50.0
+        self.last_cpu_load = load
+
+        if load > 85:
+            return self.min_workers
+        if load < 40:
+            return self.max_workers
+        return min(max(8, self.min_workers), self.max_workers)
+
+    def _run_extraction(self, files: list[dict[str, str]], workers: int) -> list[dict[str, Any]]:
+        extracted_results: list[dict[str, Any]] = []
+        with ProcessPoolExecutor(max_workers=workers) as executor:
+            futures: list[tuple[dict[str, str], Any]] = []
+            for item in files:
+                future = executor.submit(
+                    _extract_batch_candidate_worker,
+                    item["path"],
+                    item["file_name"],
+                    item["content_type"],
+                )
+                futures.append((item, future))
+
+            for item, future in futures:
+                result = future.result()
+                extracted_results.append({"meta": item, "result": result})
+        return extracted_results
+
+    async def process_batch(self, files: list[dict[str, str]]) -> tuple[list[dict[str, Any]], int, int]:
+        initial_workers = min(self.get_optimal_workers(), len(files))
+        first_pass = self._run_extraction(files, workers=max(initial_workers, self.min_workers))
+
+        self.retry_bucket = [
+            bundle["meta"]
+            for bundle in first_pass
+            if bundle.get("result", {}).get("status") != "ok"
+        ]
+
+        if not self.retry_bucket:
+            return first_pass, initial_workers, 0
+
+        # A short backoff helps avoid cascading retries while CPU/memory pressure settles.
+        await asyncio.sleep(5)
+        retry_workers = min(max(self.min_workers, initial_workers // 2), len(self.retry_bucket))
+        second_pass = self._run_extraction(self.retry_bucket, workers=max(retry_workers, 1))
+        merged: dict[str, dict[str, Any]] = {bundle["meta"]["path"]: bundle for bundle in first_pass}
+        for bundle in second_pass:
+            merged[bundle["meta"]["path"]] = bundle
+
+        return list(merged.values()), initial_workers, len(second_pass)
 
 class NeuralInk:
     @staticmethod
@@ -2974,6 +3042,88 @@ def get_ca_network_integrity(
     }
 
 
+@app.post("/api/v1/ca/verify-integrity")
+async def post_ca_verify_integrity(
+    limit: int = 800,
+    x_role: str | None = Header(default=None, alias="X-Role"),
+    x_admin_id: str | None = Header(default=None, alias="X-Admin-Id"),
+) -> dict[str, Any]:
+    require_role(x_role, {"ca", "admin"})
+    require_admin_id(x_admin_id)
+    safe_limit = min(max(limit, 1), 5000)
+
+    with closing(get_conn()) as conn:
+        entries = conn.execute(
+            """
+            SELECT id, reference, entry_fingerprint, created_at
+            FROM journal_entries
+            WHERE status = 'POSTED'
+            ORDER BY id DESC
+            LIMIT ?
+            """,
+            (safe_limit,),
+        ).fetchall()
+
+        timeline: list[dict[str, Any]] = []
+        mismatches: list[dict[str, Any]] = []
+
+        for row in entries:
+            lines = conn.execute(
+                """
+                SELECT jl.debit, jl.credit, a.name AS account_name
+                FROM journal_lines jl
+                JOIN accounts a ON a.id = jl.account_id
+                WHERE jl.entry_id = ?
+                ORDER BY jl.id ASC
+                """,
+                (int(row["id"]),),
+            ).fetchall()
+
+            expected = build_integrity_hash(str(row["reference"]), lines)
+            stored = str(row["entry_fingerprint"] or "")
+            verified = bool(stored) and stored == expected
+
+            item = {
+                "entry_id": int(row["id"]),
+                "reference": str(row["reference"]),
+                "stored_fingerprint": stored,
+                "calculated_fingerprint": expected,
+                "verified": verified,
+                "created_at": str(row["created_at"] or ""),
+            }
+            timeline.append(item)
+            if not verified:
+                mismatches.append(item)
+
+    total = len(timeline)
+    verified_count = total - len(mismatches)
+    integrity_score = round((verified_count / total) * 100, 2) if total > 0 else 100.0
+
+    forensic_summary = "Mistral forensic summary unavailable"
+    try:
+        forensic_summary = await run_ollama_generate(
+            model=FORENSIC_MODEL,
+            prompt=(
+                "You are Accord forensic verifier. Summarize ledger integrity verification in 2 lines for CA audit. "
+                f"Total entries checked: {total}. Verified: {verified_count}. Mismatches: {len(mismatches)}."
+            ),
+        )
+    except Exception:  # noqa: BLE001
+        pass
+
+    return {
+        "status": "ok",
+        "hash_algorithm": "SHA-256",
+        "total_checked": total,
+        "verified_count": verified_count,
+        "mismatch_count": len(mismatches),
+        "integrity_score": integrity_score,
+        "timeline": timeline,
+        "mismatches": mismatches,
+        "forensic_summary": str(forensic_summary).strip(),
+    }
+
+
 @app.on_event("startup")
 def startup() -> None:
     init_db()
@@ -3556,26 +3706,8 @@ async def omni_reader_ingest_batch(
     if not saved_files:
         raise HTTPException(status_code=400, detail="No readable files found in batch")
 
-    workers = min(12, len(saved_files))
-    extracted_results: list[dict[str, Any]] = []
-
-    with ProcessPoolExecutor(max_workers=workers) as executor:
-        futures: list[tuple[dict[str, str], Any]] = []
-        for item in saved_files:
-            future = executor.submit(
-                _extract_batch_candidate_worker,
-                item["path"],
-                item["file_name"],
-                item["content_type"],
-            )
-            futures.append((item, future))
-
-        for item, future in futures:
-            extracted = future.result()
-            extracted_results.append({
-                "meta": item,
-                "result": extracted,
-            })
+    adaptive_ingest = AdaptiveIngest(max_workers=12, min_workers=4)
+    extracted_results, chosen_workers, retried_count = await adaptive_ingest.process_batch(saved_files)
 
     posted: list[dict[str, Any]] = []
     failed: list[dict[str, Any]] = []
@@ -3629,7 +3761,10 @@ async def omni_reader_ingest_batch(
     return {
         "status": "processed",
         "engine": "OMNI_GOD_MODE",
-        "worker_model": f"ProcessPoolExecutor({workers})",
+        "worker_model": f"ProcessPoolExecutor({chosen_workers})",
+        "adaptive_cpu_load": round(adaptive_ingest.last_cpu_load, 2),
+        "retry_attempted": retried_count,
+        "retry_bucket_size": len(adaptive_ingest.retry_bucket),
         "submitted": len(saved_files),
         "posted_entries": len(posted),
         "failed_entries": len(failed),
@@ -3833,12 +3968,20 @@ async def post_nudge_vendor(
         )
         conn.commit()
 
+    if twilio_status == "sent":
+        nudge_status = "SENT"
+    elif str(twilio_status).startswith("failed"):
+        nudge_status = "FAILED"
+    else:
+        nudge_status = "PENDING"
+
     return {
         "status": "generated",
         "gstin": gstin,
         "vendor_name": vendor_name,
         "subject": nudge["subject"],
         "urgency": nudge["urgency"],
+        "nudge_status": nudge_status,
         "whatsapp_message": nudge["message"],
         "twilio_status": twilio_status,
     }

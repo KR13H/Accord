@@ -67,6 +67,19 @@ else
   fail "Ollama endpoint is not reachable"
 fi
 
+OLLAMA_TAGS_JSON="$(curl -fsS "http://localhost:11434/api/tags")"
+if echo "$OLLAMA_TAGS_JSON" | grep -Eq '"name":"mistral(:[^"]+)?"'; then
+  ok "Mistral model present"
+else
+  fail "Mistral model missing in Ollama registry"
+fi
+
+if echo "$OLLAMA_TAGS_JSON" | grep -Eq '"name":"llava(:[^"]+)?"'; then
+  ok "Llava model present"
+else
+  fail "Llava model missing in Ollama registry"
+fi
+
 FRIDAY_ASK="$(curl -s -X POST "$API_URL/api/v1/insights/ask-friday" -H "Content-Type: application/json" -d '{"question":"Quick launch verification risk summary","model":"llama3.2"}')"
 if echo "$FRIDAY_ASK" | grep -q '"source":"OLLAMA_LOCAL"'; then
   ok "Friday ask endpoint handshake passed"

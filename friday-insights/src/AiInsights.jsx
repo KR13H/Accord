@@ -472,7 +472,13 @@ export default function AiInsights() {
       if (!res.ok) {
         throw new Error(data?.detail || `2B reconciliation failed (${res.status})`);
       }
-      setReconcileResult(data);
+      setReconcileResult({
+        ...data,
+        ghost_invoices: (data.ghost_invoices || []).map((row) => ({
+          ...row,
+          nudge_status: String(row?.nudge_status || "PENDING").toUpperCase(),
+        })),
+      });
       setNexusGraphData(data.nexus_graph || null);
       setWizardResult(`2B reconciliation complete: ${data.ghost_invoices_count} ghost invoice(s) detected.`);
       await fetchSummary();
@@ -486,6 +492,17 @@ export default function AiInsights() {
   const sendGhostNudge = async (item) => {
     const key = `${item.entry_id}`;
     setIsNudgingGhost((prev) => ({ ...prev, [key]: true }));
+    setReconcileResult((prev) => {
+      if (!prev?.ghost_invoices) {
+        return prev;
+      }
+      return {
+        ...prev,
+        ghost_invoices: prev.ghost_invoices.map((row) =>
+          row.entry_id === item.entry_id ? { ...row, nudge_status: "PENDING" } : row
+        ),
+      };
+    });
     try {
       const res = await fetch("/api/v1/ledger/nudge-vendor", {
         method: "POST",
@@ -511,12 +528,14 @@ export default function AiInsights() {
         if (!prev?.ghost_invoices) {
           return prev;
         }
+        const nextStatus = String(data?.nudge_status || "PENDING").toUpperCase();
         return {
           ...prev,
           ghost_invoices: prev.ghost_invoices.map((row) =>
             row.entry_id === item.entry_id
               ? {
                   ...row,
+                  nudge_status: nextStatus,
                   nudge_template: {
                     ...(row.nudge_template || {}),
                     message,
@@ -529,6 +548,17 @@ export default function AiInsights() {
       });
     } catch (err) {
       setReconcileError(err instanceof Error ? err.message : "Failed to nudge vendor");
+      setReconcileResult((prev) => {
+        if (!prev?.ghost_invoices) {
+          return prev;
+        }
+        return {
+          ...prev,
+          ghost_invoices: prev.ghost_invoices.map((row) =>
+            row.entry_id === item.entry_id ? { ...row, nudge_status: "FAILED" } : row
+          ),
+        };
+      });
     } finally {
       setIsNudgingGhost((prev) => ({ ...prev, [key]: false }));
     }
@@ -1682,7 +1712,7 @@ export default function AiInsights() {
               }}
               onDrop={(event) => {
                 event.preventDefault();
-                const dropped = event.dataTransfer.files?.[0];
+                const dropped = event.dataTransfer.files;
                 void uploadOmniIngest(dropped);
               }}
             >
@@ -1796,6 +1826,19 @@ export default function AiInsights() {
                     <div key={`ghost-${item.entry_id}`} className="rounded-lg border border-red-800/50 bg-slate-950/70 px-3 py-2">
                       <p className="text-[11px] text-red-200 font-semibold">{item.reference} | {item.gstin}</p>
                       <p className="text-[11px] text-slate-400">{item.vendor_name} | Tax {formatINR(item.tax_amount)}</p>
+                      <div className="mt-1">
+                        <span
+                          className={`text-[10px] px-2 py-0.5 rounded border ${
+                            String(item.nudge_status || "PENDING").toUpperCase() === "SENT"
+                              ? "text-emerald-200 border-emerald-600/70 bg-emerald-900/30"
+                              : String(item.nudge_status || "PENDING").toUpperCase() === "FAILED"
+                                ? "text-red-200 border-red-600/70 bg-red-900/30"
+                                : "text-amber-200 border-amber-600/70 bg-amber-900/30"
+                          }`}
+                        >
+                          [{String(item.nudge_status || "PENDING").toUpperCase()}]
+                        </span>
+                      </div>
                       <div className="mt-1 flex items-center justify-between gap-3">
                         <span className="text-[10px] text-slate-500 truncate">{item.nudge_template?.message || "No nudge generated"}</span>
                         <button
@@ -1805,7 +1848,11 @@ export default function AiInsights() {
                           disabled={Boolean(isNudgingGhost[`${item.entry_id}`])}
                           className="text-[10px] px-2 py-1 rounded border border-cyan-700/70 bg-cyan-900/35 hover:bg-cyan-800/50 text-cyan-100 disabled:opacity-60"
                         >
-                          {isNudgingGhost[`${item.entry_id}`] ? "Generating..." : "WhatsApp Nudge"}
+                          {isNudgingGhost[`${item.entry_id}`]
+                            ? "Generating..."
+                            : String(item.nudge_status || "PENDING").toUpperCase() === "FAILED"
+                              ? "Retry Nudge"
+                              : "WhatsApp Nudge"}
                         </button>
                       </div>
                     </div>
