@@ -104,7 +104,7 @@ export default function NexusGraph({ graph, onRiskNodeSelect }) {
 
     let previous = performance.now();
     const tick = (now) => {
-      const dt = Math.min((now - previous) / 1000, 0.025);
+      const dt = Math.min((now - previous) / 1000, 0.0167);
       previous = now;
 
       const model = modelRef.current;
@@ -116,60 +116,65 @@ export default function NexusGraph({ graph, onRiskNodeSelect }) {
         const centerX = model.width / 2;
         const centerY = model.height / 2;
 
-        for (let i = 0; i < nodes.length; i += 1) {
-          const a = nodes[i];
-          for (let j = i + 1; j < nodes.length; j += 1) {
-            const b = nodes[j];
-            const dx = a.x - b.x;
-            const dy = a.y - b.y;
-            const dist2 = Math.max(40, dx * dx + dy * dy);
-            const force = 4200 / dist2;
-            const invDist = 1 / Math.sqrt(dist2);
-            const fx = dx * invDist * force;
-            const fy = dy * invDist * force;
-            a.vx += fx * dt;
-            a.vy += fy * dt;
-            b.vx -= fx * dt;
-            b.vy -= fy * dt;
-          }
-        }
+        const subSteps = 2;
+        const stepDt = dt / subSteps;
 
-        for (const edge of edges) {
-          const source = byId.get(edge.source);
-          const target = byId.get(edge.target);
-          if (!source || !target) {
-            continue;
+        for (let step = 0; step < subSteps; step += 1) {
+          for (let i = 0; i < nodes.length; i += 1) {
+            const a = nodes[i];
+            for (let j = i + 1; j < nodes.length; j += 1) {
+              const b = nodes[j];
+              const dx = a.x - b.x;
+              const dy = a.y - b.y;
+              const dist2 = Math.max(36, dx * dx + dy * dy);
+              const force = 5400 / dist2;
+              const invDist = 1 / Math.sqrt(dist2);
+              const fx = dx * invDist * force;
+              const fy = dy * invDist * force;
+              a.vx += fx * stepDt;
+              a.vy += fy * stepDt;
+              b.vx -= fx * stepDt;
+              b.vy -= fy * stepDt;
+            }
           }
-          const dx = target.x - source.x;
-          const dy = target.y - source.y;
-          const distance = Math.max(0.001, Math.hypot(dx, dy));
-          const targetLength = source.kind === "anchor" || target.kind === "anchor" ? 90 : 130;
-          const stretch = distance - targetLength;
-          const spring = edge.risk ? 0.11 : 0.08;
-          const fx = (dx / distance) * stretch * spring;
-          const fy = (dy / distance) * stretch * spring;
-          source.vx += fx * dt;
-          source.vy += fy * dt;
-          target.vx -= fx * dt;
-          target.vy -= fy * dt;
-        }
 
-        for (const node of nodes) {
-          const towardCenterX = (centerX - node.x) * 0.012;
-          const towardCenterY = (centerY - node.y) * 0.012;
-          node.vx += towardCenterX * dt;
-          node.vy += towardCenterY * dt;
-          node.vx *= 0.94;
-          node.vy *= 0.94;
-          node.x += node.vx * 60 * dt;
-          node.y += node.vy * 60 * dt;
-          node.x = Math.max(20, Math.min(model.width - 20, node.x));
-          node.y = Math.max(20, Math.min(model.height - 20, node.y));
+          for (const edge of edges) {
+            const source = byId.get(edge.source);
+            const target = byId.get(edge.target);
+            if (!source || !target) {
+              continue;
+            }
+            const dx = target.x - source.x;
+            const dy = target.y - source.y;
+            const distance = Math.max(0.001, Math.hypot(dx, dy));
+            const targetLength = source.kind === "anchor" || target.kind === "anchor" ? 88 : 122;
+            const stretch = distance - targetLength;
+            const spring = edge.risk ? 0.16 : 0.12;
+            const fx = (dx / distance) * stretch * spring;
+            const fy = (dy / distance) * stretch * spring;
+            source.vx += fx * stepDt;
+            source.vy += fy * stepDt;
+            target.vx -= fx * stepDt;
+            target.vy -= fy * stepDt;
+          }
+
+          for (const node of nodes) {
+            const towardCenterX = (centerX - node.x) * 0.022;
+            const towardCenterY = (centerY - node.y) * 0.022;
+            node.vx += towardCenterX * stepDt;
+            node.vy += towardCenterY * stepDt;
+            node.vx *= 0.91;
+            node.vy *= 0.91;
+            node.x += node.vx * 60 * stepDt;
+            node.y += node.vy * 60 * stepDt;
+            node.x = Math.max(20, Math.min(model.width - 20, node.x));
+            node.y = Math.max(20, Math.min(model.height - 20, node.y));
+          }
         }
       }
 
       context.clearRect(0, 0, model.width, model.height);
-      context.fillStyle = "rgba(2, 6, 23, 0.92)";
+      context.fillStyle = "rgba(0, 0, 0, 0.96)";
       context.fillRect(0, 0, model.width, model.height);
 
       const pulse = (Math.sin(now / 340) + 1) / 2;
@@ -262,21 +267,21 @@ export default function NexusGraph({ graph, onRiskNodeSelect }) {
 
   if (!graph || !Array.isArray(graph.nodes) || graph.nodes.length === 0) {
     return (
-      <div className="rounded-2xl border border-slate-800 bg-slate-950/70 p-4 text-sm text-slate-400">
+      <div className="rounded-2xl bg-black/90 p-4 text-sm text-slate-300">
         Nexus graph is empty. Run GSTR-2B reconciliation to generate network intelligence.
       </div>
     );
   }
 
   return (
-    <div className="rounded-2xl border border-cyan-700/35 bg-black/85 p-4">
+    <div className="rounded-2xl bg-black/95 p-4">
       <div className="mb-3 flex items-center justify-between gap-3">
         <p className="text-sm font-semibold text-cyan-100">Nexus Graph Visualizer</p>
         <span className="text-[11px] text-slate-400">
           Nodes: {view.nodes.length} | Edges: {view.edges.length}
         </span>
       </div>
-      <div ref={containerRef} className="rounded-lg border border-slate-800 bg-slate-950/70 overflow-hidden">
+      <div ref={containerRef} className="rounded-lg bg-black overflow-hidden" style={{ boxShadow: "inset 0 0 0 1px #0f172a" }}>
         <canvas ref={canvasRef} className="block w-full h-[320px] cursor-crosshair" onClick={onCanvasClick} />
       </div>
       <p className="mt-2 text-[10px] uppercase tracking-[0.18em] text-slate-500">

@@ -194,6 +194,9 @@ export default function AiInsights() {
   const [isUploadingReceipt, setIsUploadingReceipt] = useState(false);
   const [receiptError, setReceiptError] = useState("");
   const [receiptResult, setReceiptResult] = useState(null);
+  const [isMobileSyncing, setIsMobileSyncing] = useState(false);
+  const [mobileSyncActive, setMobileSyncActive] = useState(false);
+  const [mobileSyncResult, setMobileSyncResult] = useState(null);
   const [isExportingTally, setIsExportingTally] = useState(false);
   const [isBatchUploading, setIsBatchUploading] = useState(false);
   const [batchUploadError, setBatchUploadError] = useState("");
@@ -211,6 +214,7 @@ export default function AiInsights() {
   const [omniResult, setOmniResult] = useState(null);
   const [omniError, setOmniError] = useState("");
   const [isOmniUploading, setIsOmniUploading] = useState(false);
+  const [omniUploadProgress, setOmniUploadProgress] = useState(0);
   const [isRetryingOmniFailed, setIsRetryingOmniFailed] = useState(false);
   const [voiceResult, setVoiceResult] = useState(null);
   const [voiceError, setVoiceError] = useState("");
@@ -218,6 +222,8 @@ export default function AiInsights() {
   const [reconcileResult, setReconcileResult] = useState(null);
   const [reconcileError, setReconcileError] = useState("");
   const [isReconciling2b, setIsReconciling2b] = useState(false);
+  const [radarRiskFilter, setRadarRiskFilter] = useState("ALL");
+  const [radarSortMode, setRadarSortMode] = useState("RISK_DESC");
   const [nexusGraphData, setNexusGraphData] = useState(null);
   const [isNudgingGhost, setIsNudgingGhost] = useState({});
   const [selectedRiskNode, setSelectedRiskNode] = useState(null);
@@ -382,6 +388,7 @@ export default function AiInsights() {
       return;
     }
     setIsOmniUploading(true);
+    setOmniUploadProgress(0);
     setOmniError("");
     setOmniResult(null);
     try {
@@ -393,18 +400,32 @@ export default function AiInsights() {
         formData.append("file", files[0]);
       }
 
-      const res = await fetch(endpoint, {
-        method: "POST",
-        headers: {
-          "X-Role": adminRole,
-          "X-Admin-Id": adminId,
-        },
-        body: formData,
+      const { status, data } = await new Promise((resolve, reject) => {
+        const xhr = new XMLHttpRequest();
+        xhr.open("POST", endpoint);
+        xhr.responseType = "json";
+        xhr.setRequestHeader("X-Role", adminRole);
+        xhr.setRequestHeader("X-Admin-Id", adminId);
+        xhr.upload.onprogress = (event) => {
+          if (!event.lengthComputable) {
+            return;
+          }
+          const nextProgress = Math.round((event.loaded / event.total) * 100);
+          setOmniUploadProgress(Math.max(1, Math.min(100, nextProgress)));
+        };
+        xhr.onerror = () => reject(new Error("Network error during Omni ingest upload"));
+        xhr.onload = () => {
+          const payload = xhr.response ?? {};
+          resolve({ status: xhr.status, data: payload });
+        };
+        xhr.send(formData);
       });
-      const data = await res.json();
-      if (!res.ok) {
-        throw new Error(data?.detail || `Omni ingest failed (${res.status})`);
+
+      if (!(status >= 200 && status < 300)) {
+        throw new Error(data?.detail || data?.error?.detail || `Omni ingest failed (${status})`);
       }
+
+      setOmniUploadProgress(100);
       setOmniResult(data);
       if (files.length > 1) {
         setWizardResult(`Omni mixed-batch posted ${data.posted_entries ?? 0}/${data.submitted ?? files.length} file(s).`);
@@ -416,6 +437,7 @@ export default function AiInsights() {
       setOmniError(err instanceof Error ? err.message : "Failed Omni ingestion");
     } finally {
       setIsOmniUploading(false);
+      setTimeout(() => setOmniUploadProgress(0), 1200);
     }
   };
 
@@ -517,6 +539,7 @@ export default function AiInsights() {
         ...data,
         ghost_invoices: (data.ghost_invoices || []).map((row) => ({
           ...row,
+          risk_level: String(row?.risk_level || "LOW").toUpperCase(),
           nudge_status: String(row?.nudge_status || "PENDING").toUpperCase(),
         })),
       });
@@ -664,13 +687,64 @@ export default function AiInsights() {
 
   const ghostInvoices = useMemo(() => {
     const all = reconcileResult?.ghost_invoices || [];
-    if (!selectedRiskNode?.id) {
-      return all;
+    let scoped = all;
+    if (selectedRiskNode?.id) {
+      const selected = String(selectedRiskNode.id).toUpperCase();
+      const filteredByNode = all.filter((item) => String(item?.gstin || "").toUpperCase() === selected);
+      scoped = filteredByNode.length > 0 ? filteredByNode : all;
     }
-    const selected = String(selectedRiskNode.id).toUpperCase();
-    const filtered = all.filter((item) => String(item?.gstin || "").toUpperCase() === selected);
-    return filtered.length > 0 ? filtered : all;
-  }, [reconcileResult, selectedRiskNode]);
+
+    let filtered = scoped;
+    if (radarRiskFilter !== "ALL") {
+      filtered = filtered.filter((item) => String(item?.risk_level || "LOW").toUpperCase() === radarRiskFilter);
+    }
+
+    const riskRank = { CRITICAL: 4, HIGH: 3, MEDIUM: 2, LOW: 1 };
+    const sorted = [...filtered].sort((a, b) => {
+      const taxA = Number(a?.tax_amount || 0);
+      const taxB = Number(b?.tax_amount || 0);
+      const confidenceA = Number(a?.fuzzy_match_confidence || 0);
+      const confidenceB = Number(b?.fuzzy_match_confidence || 0);
+      const riskA = riskRank[String(a?.risk_level || "LOW").toUpperCase()] || 1;
+      const riskB = riskRank[String(b?.risk_level || "LOW").toUpperCase()] || 1;
+
+      if (radarSortMode === "LEAK_DESC") {
+        return taxB - taxA;
+      }
+      if (radarSortMode === "CONFIDENCE_ASC") {
+        return confidenceA - confidenceB;
+      }
+      return riskB - riskA || taxB - taxA;
+    });
+
+    return sorted;
+  }, [reconcileResult, selectedRiskNode, radarRiskFilter, radarSortMode]);
+
+  const anomalySummary = useMemo(() => {
+    const fromBackend = reconcileResult?.anomaly_summary;
+    if (fromBackend) {
+      return fromBackend;
+    }
+
+    const all = reconcileResult?.ghost_invoices || [];
+    const risk_breakdown = { CRITICAL: 0, HIGH: 0, MEDIUM: 0, LOW: 0 };
+    let total = 0;
+    all.forEach((item) => {
+      const level = String(item?.risk_level || "LOW").toUpperCase();
+      if (risk_breakdown[level] !== undefined) {
+        risk_breakdown[level] += 1;
+      }
+      total += Number(item?.tax_amount || 0);
+    });
+
+    return {
+      detection_engine: "GSTR2B_RADAR",
+      total_potential_tax_leak: total,
+      risk_breakdown,
+      mismatch_rate_pct: all.length > 0 ? Math.round((all.length / Math.max(Number(reconcileResult?.ledger_records || 1), 1)) * 10000) / 100 : 0,
+      top_leak_vendors: [],
+    };
+  }, [reconcileResult]);
 
   const inviteCaOnboard = async () => {
     const email = caInviteEmail.trim().toLowerCase();
@@ -1182,6 +1256,40 @@ export default function AiInsights() {
     }
   };
 
+  const uploadMobileSync = async (file) => {
+    if (!file) {
+      return;
+    }
+    setIsMobileSyncing(true);
+    setMobileSyncActive(true);
+    setReceiptError("");
+    setMobileSyncResult(null);
+    try {
+      const formData = new FormData();
+      formData.append("file", file);
+      const res = await fetch("/api/v1/ledger/mobile-sync", {
+        method: "POST",
+        headers: {
+          "X-Role": adminRole,
+          "X-Admin-Id": adminId,
+        },
+        body: formData,
+      });
+      const data = await res.json();
+      if (!res.ok) {
+        throw new Error(data?.error?.detail || data?.detail || `Unable to complete mobile sync (${res.status})`);
+      }
+      setMobileSyncResult(data);
+      setWizardResult(`Mobile sync posted as journal ${data.reference} (#${data.entry_id}).`);
+      await fetchSummary();
+    } catch (err) {
+      setReceiptError(err instanceof Error ? err.message : "Failed mobile sync");
+      setMobileSyncActive(false);
+    } finally {
+      setIsMobileSyncing(false);
+    }
+  };
+
   const exportTallyXml = async (entryId) => {
     if (!entryId) {
       return;
@@ -1346,6 +1454,22 @@ export default function AiInsights() {
     };
   }, [summary, topVendors, forensicAudit, telemetry]);
 
+  const tallyClock = useMemo(() => {
+    const aiProcessedDocs =
+      Number(reversalEntries.length || 0) +
+      Number(batchUploadResults?.total_processed || 0) +
+      (receiptResult ? 1 : 0) +
+      (mobileSyncResult ? 1 : 0) +
+      (neuralInkResult ? 1 : 0);
+    const manualSecondsPerDoc = 180;
+    const aiSecondsPerDoc = 12;
+    const secondsSaved = Math.max(0, aiProcessedDocs * (manualSecondsPerDoc - aiSecondsPerDoc));
+    return {
+      docs: aiProcessedDocs,
+      secondsSaved,
+    };
+  }, [reversalEntries.length, batchUploadResults, receiptResult, mobileSyncResult, neuralInkResult]);
+
   const pulsePoints = useMemo(() => {
     if (m3PulseHistory.length === 0) {
       return "";
@@ -1484,7 +1608,32 @@ export default function AiInsights() {
                 <Camera className="w-4 h-4 text-emerald-300" />
                 <p className="text-xs font-semibold text-emerald-100">Vision Ledger Scan</p>
               </div>
+              <div className="flex items-center justify-between rounded-lg border border-cyan-700/50 bg-black/40 px-2.5 py-2">
+                <p className="text-[11px] uppercase tracking-[0.16em] text-cyan-200">Mobile Capture Active</p>
+                <span
+                  className={`text-[11px] font-semibold ${
+                    mobileSyncActive || isMobileSyncing ? "text-emerald-300" : "text-slate-500"
+                  }`}
+                >
+                  {mobileSyncActive || isMobileSyncing ? "ACTIVE" : "IDLE"}
+                </span>
+              </div>
               <p className="text-[11px] text-slate-400">Capture or upload receipt image, auto-post journal, then export Tally XML.</p>
+              <label className="w-full inline-flex items-center justify-center gap-2 rounded-lg border border-cyan-600/70 bg-cyan-900/35 hover:bg-cyan-800/50 px-3 py-2 text-xs font-semibold cursor-pointer">
+                {isMobileSyncing ? "Syncing Mobile Capture..." : "Ghost-Ledger Mobile Sync"}
+                <input
+                  type="file"
+                  accept="image/*"
+                  capture="environment"
+                  disabled={isMobileSyncing}
+                  className="hidden"
+                  onChange={(event) => {
+                    const picked = event.target.files?.[0];
+                    void uploadMobileSync(picked);
+                    event.target.value = "";
+                  }}
+                />
+              </label>
               <label className="w-full inline-flex items-center justify-center gap-2 rounded-lg border border-emerald-700/70 bg-emerald-900/35 hover:bg-emerald-800/50 px-3 py-2 text-xs font-semibold cursor-pointer">
                 {isUploadingReceipt ? "Processing..." : "Scan Receipt"}
                 <input
@@ -1570,6 +1719,17 @@ export default function AiInsights() {
                   </button>
                 </div>
               ) : null}
+              {mobileSyncResult ? (
+                <div className="rounded-lg border border-cyan-700/50 bg-slate-950/70 p-2 space-y-1">
+                  <p className="text-[11px] text-cyan-200 font-semibold">
+                    {mobileSyncResult.reference} | INR {mobileSyncResult.extracted?.total_amount}
+                  </p>
+                  <p className="text-[11px] text-slate-400 truncate">
+                    {mobileSyncResult.extracted?.vendor || "Vendor unknown"}
+                    {mobileSyncResult.extracted?.gstin ? ` | ${mobileSyncResult.extracted.gstin}` : ""}
+                  </p>
+                </div>
+              ) : null}
               {neuralInkResult ? (
                 <div className="rounded-lg border border-fuchsia-700/50 bg-slate-950/70 p-2 space-y-1">
                   <p className="text-[11px] text-fuchsia-200 font-semibold">
@@ -1597,12 +1757,17 @@ export default function AiInsights() {
             <h1 className="text-2xl sm:text-3xl font-bold tracking-tight">Cash-Flow Protection Command Center</h1>
             <p className="text-sm text-slate-400 mt-1">As of {summary?.as_of_date}</p>
           </div>
-          <div className="grid grid-cols-1 sm:grid-cols-3 gap-3 w-full sm:w-auto">
+          <div className="grid grid-cols-1 sm:grid-cols-4 gap-3 w-full sm:w-auto">
             <div className="rounded-xl border border-white/15 bg-black/70 px-4 py-3 glass-panel">
               <p className="text-xs text-slate-400">Potential Interest Savings</p>
               <p className="text-xl font-mono font-bold text-emerald-300">
                 {formatINR(summary?.summary?.total_potential_interest_savings)}
               </p>
+            </div>
+            <div className="rounded-xl bg-black/80 px-4 py-3" style={{ boxShadow: "inset 0 0 0 1px #0f172a" }}>
+              <p className="text-xs uppercase tracking-[0.16em] text-cyan-200">Tally-Clock</p>
+              <p className="text-xl font-mono font-bold text-white mt-1">{tallyClock.secondsSaved.toLocaleString("en-IN")}s</p>
+              <p className="text-[11px] text-slate-400 mt-1">{tallyClock.docs} docs auto-processed vs manual entry</p>
             </div>
             <button
               onClick={() => setDeckMode((prev) => !prev)}
@@ -1792,7 +1957,18 @@ export default function AiInsights() {
               </svg>
             </div>
 
-            {isOmniUploading ? <p className="text-xs text-cyan-200">Ingesting with Omni-Reader...</p> : null}
+            {isOmniUploading ? (
+              <div className="space-y-2">
+                <p className="text-xs text-cyan-200">Ingesting with Omni-Reader... {omniUploadProgress}%</p>
+                <div className="h-2 rounded-full bg-slate-900/90 overflow-hidden border border-cyan-900/50">
+                  <motion.div
+                    className="h-full bg-cyan-300"
+                    animate={{ width: `${Math.max(2, omniUploadProgress)}%` }}
+                    transition={{ duration: 0.2, ease: "easeOut" }}
+                  />
+                </div>
+              </div>
+            ) : null}
             {omniError ? <p className="text-xs text-red-300">{omniError}</p> : null}
             {omniResult ? (
               <div className="rounded-lg border border-emerald-700/45 bg-emerald-900/20 p-3 text-xs text-emerald-100 space-y-2">
@@ -1878,14 +2054,62 @@ export default function AiInsights() {
                 <p className="text-xs text-red-100 font-semibold">
                   Ghost Invoices: {reconcileResult.ghost_invoices_count} | Ledger Rows: {reconcileResult.ledger_records}
                 </p>
+                <div className="grid grid-cols-2 lg:grid-cols-4 gap-2">
+                  <div className="rounded border border-red-800/50 bg-black/40 px-2.5 py-2">
+                    <p className="text-[10px] text-slate-400 uppercase tracking-[0.12em]">Potential Tax Leak</p>
+                    <p className="text-sm font-semibold text-red-200">{formatINR(anomalySummary?.total_potential_tax_leak || 0)}</p>
+                  </div>
+                  <div className="rounded border border-red-800/50 bg-black/40 px-2.5 py-2">
+                    <p className="text-[10px] text-slate-400 uppercase tracking-[0.12em]">Critical</p>
+                    <p className="text-sm font-semibold text-red-300">{anomalySummary?.risk_breakdown?.CRITICAL || 0}</p>
+                  </div>
+                  <div className="rounded border border-red-800/50 bg-black/40 px-2.5 py-2">
+                    <p className="text-[10px] text-slate-400 uppercase tracking-[0.12em]">High</p>
+                    <p className="text-sm font-semibold text-amber-300">{anomalySummary?.risk_breakdown?.HIGH || 0}</p>
+                  </div>
+                  <div className="rounded border border-red-800/50 bg-black/40 px-2.5 py-2">
+                    <p className="text-[10px] text-slate-400 uppercase tracking-[0.12em]">Mismatch Rate</p>
+                    <p className="text-sm font-semibold text-cyan-200">{Number(anomalySummary?.mismatch_rate_pct || 0).toFixed(2)}%</p>
+                  </div>
+                </div>
+
+                <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
+                  <select
+                    value={radarRiskFilter}
+                    onChange={(event) => setRadarRiskFilter(event.target.value)}
+                    className="rounded border border-red-800/60 bg-slate-950 px-2.5 py-1.5 text-xs text-red-100"
+                  >
+                    <option value="ALL">Filter: All Risk Levels</option>
+                    <option value="CRITICAL">Filter: Critical</option>
+                    <option value="HIGH">Filter: High</option>
+                    <option value="MEDIUM">Filter: Medium</option>
+                    <option value="LOW">Filter: Low</option>
+                  </select>
+                  <select
+                    value={radarSortMode}
+                    onChange={(event) => setRadarSortMode(event.target.value)}
+                    className="rounded border border-red-800/60 bg-slate-950 px-2.5 py-1.5 text-xs text-red-100"
+                  >
+                    <option value="RISK_DESC">Sort: Risk (High to Low)</option>
+                    <option value="LEAK_DESC">Sort: Leak Amount (High to Low)</option>
+                    <option value="CONFIDENCE_ASC">Sort: Confidence (Low to High)</option>
+                  </select>
+                </div>
+
                 {selectedRiskNode?.id ? (
                   <p className="text-[11px] text-cyan-200">Radar focus: {selectedRiskNode.id}</p>
                 ) : null}
                 <div className="space-y-2 max-h-48 overflow-y-auto">
                   {ghostInvoices.slice(0, 12).map((item) => (
                     <div key={`ghost-${item.entry_id}`} className="rounded-lg border border-red-800/50 bg-slate-950/70 px-3 py-2">
-                      <p className="text-[11px] text-red-200 font-semibold">{item.reference} | {item.gstin}</p>
-                      <p className="text-[11px] text-slate-400">{item.vendor_name} | Tax {formatINR(item.tax_amount)}</p>
+                      <p className="text-[11px] text-red-200 font-semibold">
+                        {item.reference} | {item.gstin}
+                        <span className="ml-2 text-[10px] text-amber-300">{String(item.risk_level || "LOW").toUpperCase()}</span>
+                      </p>
+                      <p className="text-[11px] text-slate-400">{item.vendor_name} | Potential Leak {formatINR(item.tax_amount)}</p>
+                      <p className="text-[10px] text-slate-500">
+                        Confidence: {Math.round(Number(item.fuzzy_match_confidence || 0) * 100)}% | Action: {item.recommended_action || "MONITOR"}
+                      </p>
                       <div className="mt-1">
                         <span
                           className={`text-[10px] px-2 py-0.5 rounded border ${

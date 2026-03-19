@@ -9,6 +9,7 @@ import io
 import hmac
 import smtplib
 import os
+import sys
 import secrets
 import shutil
 import uuid
@@ -27,10 +28,22 @@ from email.message import EmailMessage
 from fastapi import FastAPI, File, Header, HTTPException, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, Response
+from fastapi.routing import APIRoute
 import httpx
 from pydantic import BaseModel, Field
 from reportlab.lib.pagesizes import A4
 from reportlab.pdfgen import canvas
+
+CURRENT_DIR = Path(__file__).resolve().parent
+if str(CURRENT_DIR) not in sys.path:
+    sys.path.insert(0, str(CURRENT_DIR))
+
+from services.accounting_service import AccountingService
+from services.compliance_service import ComplianceService
+from services.ingest_service import IngestService
+from services.inventory_service import InventoryService
+from services.telemetry_service import TelemetryService
+from services.voucher_service import VoucherService
 
 
 DB_PATH = Path(__file__).with_name("ledger.db")
@@ -94,7 +107,7 @@ OMNI_INGEST_DIR = STORAGE_ROOT / "omni_ingest"
 PROCESSED_ARCHIVE_DIR = STORAGE_ROOT / "processed_archives"
 NEXUS_GRAPH_DIR = STORAGE_ROOT / "nexus_graphs"
 RAM_DISK_BUFFER = Path("/Volumes/AccordCache/receipt_buffer")
-MAX_PARALLEL_WORKERS = 10  # M3 8-core: 4 perf + 4 efficiency = 10 workers for IO balance
+MAX_PARALLEL_WORKERS = 16  # M3 adaptive upper bound for mixed I/O + OCR workloads
 
 try:
     import cv2  # type: ignore
@@ -1271,6 +1284,7 @@ def _extract_batch_candidate_worker(file_path_str: str, file_name: str, content_
             "status": "failed",
             "file": file_name,
             "reason": str(exc),
+            "audit_id": uuid.uuid4().hex[:12],
         }
 
 
@@ -1281,7 +1295,7 @@ class AdaptiveIngest:
     breaker pauses the queue if sustained saturation is detected.
     """
 
-    def __init__(self, max_workers: int = 12, min_workers: int = 4):
+    def __init__(self, max_workers: int = 16, min_workers: int = 4):
         self.max_workers = max_workers
         self.min_workers = min_workers
         self.retry_bucket: list[dict[str, str]] = []
@@ -1320,15 +1334,15 @@ class AdaptiveIngest:
             available_gb = 4.0
         self.last_memory_available_gb = available_gb
 
-        sustained_hot = all(sample > 90 for sample in load_samples)
+        sustained_hot = all(sample > 80 for sample in load_samples)
         self.circuit_breaker_open = sustained_hot
         if sustained_hot:
-            self.saturation_alert = "CPU >90% for 5s, queue paused for thermal safety"
+            self.saturation_alert = "Thermal pressure high (>80%), throttling worker pool"
             return self.min_workers
 
-        if avg_load > 85 or available_gb < 2.5:
+        if avg_load > 80 or available_gb < 2.5:
             return self.min_workers
-        if avg_load < 40 and available_gb > 6.0:
+        if avg_load < 30 and available_gb > 6.0:
             return self.max_workers
         return min(max(8, self.min_workers), self.max_workers)
 
@@ -1347,6 +1361,8 @@ class AdaptiveIngest:
 
             for item, future in futures:
                 result = future.result()
+                if result.get("status") != "ok":
+                    result.setdefault("audit_id", uuid.uuid4().hex[:12])
                 extracted_results.append({"meta": item, "result": result})
         return extracted_results
 
@@ -1492,7 +1508,96 @@ class IngestBatchRetryIn(BaseModel):
     batch_id: str = Field(min_length=8, max_length=64)
 
 
+class TallySyncFinalIn(BaseModel):
+    entry_ids: list[int] = Field(min_length=1, max_length=2000)
+
+
+class InventoryBatchUpsertIn(BaseModel):
+    sku_code: str = Field(min_length=1, max_length=80)
+    sku_name: str = Field(min_length=1, max_length=200)
+    batch_code: str = Field(min_length=1, max_length=80)
+    hsn_code: str = Field(min_length=6, max_length=12)
+    gst_rate: Decimal = Field(ge=0)
+    quantity: Decimal = Field(gt=0)
+    unit_cost: Decimal = Field(ge=0)
+    expiry_date: date | None = None
+
+
 app = FastAPI(title="Friday Insights Ledger API", version="1.0.0")
+
+telemetry_service = TelemetryService(api_logger=api_logger, latency_warn_threshold_ms=LATENCY_WARN_THRESHOLD_MS)
+performance_monitor = telemetry_service.performance_monitor
+
+
+class PerformanceRoute(APIRoute):
+    """Applies the performance monitor decorator to every API route handler."""
+
+    def get_route_handler(self):
+        route_handler = super().get_route_handler()
+        monitored_handler = performance_monitor(endpoint_name=self.path)(route_handler)
+
+        async def custom_route_handler(request: Request):
+            return await monitored_handler(request)
+
+        return custom_route_handler
+
+
+app.router.route_class = PerformanceRoute
+
+accounting_service: AccountingService | None = None
+ingest_service: IngestService | None = None
+compliance_service: ComplianceService | None = None
+inventory_service: InventoryService | None = None
+voucher_service = VoucherService()
+
+
+def ensure_service_layer() -> tuple[AccountingService, IngestService, ComplianceService, InventoryService]:
+    """Builds the service layer on first use after helper functions are available.
+
+    Hardware Impact:
+        One-time object construction with no recurring runtime overhead.
+    Logic Invariants:
+        Returns initialized service singletons for the current process.
+    Legal Context:
+        Centralized service wiring keeps audit-critical logic paths consistent.
+    """
+    global accounting_service, ingest_service, compliance_service, inventory_service
+
+    if accounting_service is None:
+        accounting_service = AccountingService(
+            get_conn=get_conn,
+            post_ledger_entry_from_extract=_post_ledger_entry_from_extract,
+            generate_tally_export=generate_tally_export,
+        )
+
+    if ingest_service is None:
+        ingest_service = IngestService(
+            ram_disk_buffer=RAM_DISK_BUFFER,
+            extract_text_with_tesseract=extract_text_with_tesseract,
+            extract_receipt_fields=extract_receipt_fields,
+            parse_amount_from_text=parse_amount_from_text,
+            money_str=money_str,
+            accounting_service=accounting_service,
+        )
+
+    if compliance_service is None:
+        compliance_service = ComplianceService(
+            extract_2b_records=_extract_2b_records,
+            build_nexus_graph=_build_nexus_graph,
+            draft_vendor_nudge_message=_draft_vendor_nudge_message,
+            run_ollama_generate=run_ollama_generate,
+            forensic_model=FORENSIC_MODEL,
+            parse_amount_from_text=parse_amount_from_text,
+            money_str=money_str,
+        )
+
+    if inventory_service is None:
+        inventory_service = InventoryService(
+            get_conn=get_conn,
+            allowed_hsn_slabs=GST_2026_ALLOWED_SLABS,
+        )
+
+    return accounting_service, ingest_service, compliance_service, inventory_service
 
 app.add_middleware(
     CORSMiddleware,
@@ -1508,52 +1613,54 @@ async def request_telemetry_middleware(request: Request, call_next):
     request_id = uuid.uuid4().hex[:12]
     started_at = datetime.utcnow().isoformat(timespec="seconds") + "Z"
     start_ts = datetime.utcnow().timestamp()
+    request.state.request_id = request_id
 
     response = await call_next(request)
     elapsed_ms = (datetime.utcnow().timestamp() - start_ts) * 1000
     response.headers["X-Request-Id"] = request_id
-
-    if elapsed_ms > LATENCY_WARN_THRESHOLD_MS:
-        api_logger.warning(
-            "Saturation warning request_id=%s method=%s path=%s latency_ms=%.1f started_at=%s",
-            request_id,
-            request.method,
-            request.url.path,
-            elapsed_ms,
-            started_at,
-        )
+    telemetry_service.log_latency(
+        method=request.method,
+        path=request.url.path,
+        elapsed_ms=elapsed_ms,
+        started_at=started_at,
+        request_id=request_id,
+    )
     return response
 
 
 @app.exception_handler(HTTPException)
-async def http_exception_handler(_: Request, exc: HTTPException) -> JSONResponse:
-    error_id = uuid.uuid4().hex[:12]
+async def http_exception_handler(request: Request, exc: HTTPException) -> JSONResponse:
+    envelope = telemetry_service.build_error_envelope(
+        detail=str(exc.detail),
+        status_code=exc.status_code,
+        path=request.url.path,
+        error_type="HTTP_EXCEPTION",
+        request_id=getattr(request.state, "request_id", None),
+    )
     return JSONResponse(
         status_code=exc.status_code,
-        content={
-            "status": "error",
-            "error_id": error_id,
-            "detail": exc.detail,
-        },
+        content=envelope,
     )
 
 
 @app.exception_handler(Exception)
 async def global_exception_handler(request: Request, exc: Exception) -> JSONResponse:
-    error_id = uuid.uuid4().hex[:12]
+    envelope = telemetry_service.build_error_envelope(
+        detail="Internal server error",
+        status_code=500,
+        path=request.url.path,
+        error_type=type(exc).__name__,
+        request_id=getattr(request.state, "request_id", None),
+    )
     api_logger.exception(
-        "Unhandled exception error_id=%s method=%s path=%s",
-        error_id,
+        "Unhandled exception audit_id=%s method=%s path=%s",
+        envelope["error"]["audit_id"],
         request.method,
         request.url.path,
     )
     return JSONResponse(
         status_code=500,
-        content={
-            "status": "error",
-            "error_id": error_id,
-            "detail": "Internal server error",
-        },
+        content=envelope,
     )
 
 
@@ -1597,7 +1704,10 @@ def init_db() -> None:
                 filed_export_hash TEXT NULL,
                 approved_by_1 INTEGER NULL,
                 approved_by_2 INTEGER NULL,
+                voucher_type TEXT NOT NULL DEFAULT 'JOURNAL',
                 entry_fingerprint TEXT NULL,
+                previous_entry_fingerprint TEXT NULL,
+                cumulative_block_hash TEXT NULL,
                 created_at TEXT NOT NULL
             );
 
@@ -1720,6 +1830,24 @@ def init_db() -> None:
                 updated_at TEXT NOT NULL
             );
 
+            CREATE TABLE IF NOT EXISTS inventory_batches (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                sku_code TEXT NOT NULL,
+                sku_name TEXT NOT NULL,
+                batch_code TEXT NOT NULL,
+                hsn_code TEXT NOT NULL,
+                gst_rate TEXT NOT NULL,
+                quantity TEXT NOT NULL,
+                unit_cost TEXT NOT NULL,
+                total_value TEXT NOT NULL,
+                expiry_date TEXT NULL,
+                status TEXT NOT NULL DEFAULT 'ACTIVE' CHECK(status IN ('ACTIVE', 'EXPIRED', 'DEPLETED')),
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                created_by INTEGER NOT NULL,
+                UNIQUE(sku_code, batch_code)
+            );
+
             CREATE TABLE IF NOT EXISTS journal_lines (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 entry_id INTEGER NOT NULL,
@@ -1755,6 +1883,7 @@ def init_db() -> None:
             CREATE INDEX IF NOT EXISTS idx_ca_invites_expires_status ON ca_invites(expires_at, status);
             CREATE INDEX IF NOT EXISTS idx_receipt_imports_entry ON receipt_imports(entry_id);
             CREATE INDEX IF NOT EXISTS idx_marketing_signups_updated_at ON marketing_signups(updated_at);
+            CREATE INDEX IF NOT EXISTS idx_inventory_batches_status_expiry ON inventory_batches(status, expiry_date);
             """
         )
 
@@ -1770,6 +1899,7 @@ def init_db() -> None:
 
         seed_periods(conn)
         seed_hsn_master(conn)
+        backfill_chain_of_trust(conn)
         conn.commit()
 
 
@@ -1885,6 +2015,15 @@ def migrate_legacy_schema(conn: sqlite3.Connection) -> None:
 
     if not table_has_column(conn, "journal_entries", "entry_fingerprint"):
         conn.execute("ALTER TABLE journal_entries ADD COLUMN entry_fingerprint TEXT NULL;")
+
+    if not table_has_column(conn, "journal_entries", "voucher_type"):
+        conn.execute("ALTER TABLE journal_entries ADD COLUMN voucher_type TEXT NOT NULL DEFAULT 'JOURNAL';")
+
+    if not table_has_column(conn, "journal_entries", "previous_entry_fingerprint"):
+        conn.execute("ALTER TABLE journal_entries ADD COLUMN previous_entry_fingerprint TEXT NULL;")
+
+    if not table_has_column(conn, "journal_entries", "cumulative_block_hash"):
+        conn.execute("ALTER TABLE journal_entries ADD COLUMN cumulative_block_hash TEXT NULL;")
 
     if not table_has_column(conn, "audit_edit_logs", "high_priority"):
         conn.execute(
@@ -2004,12 +2143,31 @@ def migrate_legacy_schema(conn: sqlite3.Connection) -> None:
             updated_at TEXT NOT NULL
         );
 
+        CREATE TABLE IF NOT EXISTS inventory_batches (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            sku_code TEXT NOT NULL,
+            sku_name TEXT NOT NULL,
+            batch_code TEXT NOT NULL,
+            hsn_code TEXT NOT NULL,
+            gst_rate TEXT NOT NULL,
+            quantity TEXT NOT NULL,
+            unit_cost TEXT NOT NULL,
+            total_value TEXT NOT NULL,
+            expiry_date TEXT NULL,
+            status TEXT NOT NULL DEFAULT 'ACTIVE' CHECK(status IN ('ACTIVE', 'EXPIRED', 'DEPLETED')),
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            created_by INTEGER NOT NULL,
+            UNIQUE(sku_code, batch_code)
+        );
+
         CREATE INDEX IF NOT EXISTS idx_vendor_trust_score ON vendor_trust_scores(filing_consistency_score);
         CREATE INDEX IF NOT EXISTS idx_safe_harbor_attestations_as_of ON safe_harbor_attestations(as_of_date, created_at);
         CREATE INDEX IF NOT EXISTS idx_ca_invites_email_status ON ca_invites(email, status);
         CREATE INDEX IF NOT EXISTS idx_ca_invites_expires_status ON ca_invites(expires_at, status);
         CREATE INDEX IF NOT EXISTS idx_receipt_imports_entry ON receipt_imports(entry_id);
         CREATE INDEX IF NOT EXISTS idx_marketing_signups_updated_at ON marketing_signups(updated_at);
+        CREATE INDEX IF NOT EXISTS idx_inventory_batches_status_expiry ON inventory_batches(status, expiry_date);
         """
     )
 
@@ -2253,9 +2411,154 @@ def stamp_entry_fingerprint(conn: sqlite3.Connection, entry_id: int) -> str:
     if not lines:
         return ""
 
+    normalized_lines = [
+        {
+            "account_name": str(line["name"]) if "name" in line.keys() else "",
+            "debit": line["debit"],
+            "credit": line["credit"],
+        }
+        for line in conn.execute(
+            """
+            SELECT jl.debit, jl.credit, a.name
+            FROM journal_lines jl
+            JOIN accounts a ON a.id = jl.account_id
+            WHERE jl.entry_id = ?
+            ORDER BY jl.id ASC
+            """,
+            (entry_id,),
+        ).fetchall()
+    ]
+    voucher_type = voucher_service.classify_from_lines(normalized_lines)
+
+    previous = conn.execute(
+        """
+        SELECT id, entry_fingerprint, cumulative_block_hash
+        FROM journal_entries
+        WHERE id < ?
+        ORDER BY id DESC
+        LIMIT 1
+        """,
+        (entry_id,),
+    ).fetchone()
+    previous_fingerprint = str(previous["entry_fingerprint"] or "") if previous is not None else "GENESIS"
+    previous_block_hash = str(previous["cumulative_block_hash"] or previous_fingerprint) if previous is not None else "GENESIS"
+
     digest = build_integrity_hash(str(entry["reference"]), lines)
-    conn.execute("UPDATE journal_entries SET entry_fingerprint = ? WHERE id = ?", (digest, entry_id))
+    cumulative_block_hash = sha256(f"{previous_block_hash}:{digest}".encode("utf-8")).hexdigest()
+
+    conn.execute(
+        """
+        UPDATE journal_entries
+        SET entry_fingerprint = ?,
+            previous_entry_fingerprint = ?,
+            cumulative_block_hash = ?,
+            voucher_type = ?
+        WHERE id = ?
+        """,
+        (digest, previous_fingerprint, cumulative_block_hash, voucher_type, entry_id),
+    )
     return digest
+
+
+def backfill_chain_of_trust(conn: sqlite3.Connection) -> None:
+    rows = conn.execute(
+        """
+        SELECT id
+        FROM journal_entries
+        ORDER BY id ASC
+        """
+    ).fetchall()
+    for row in rows:
+        stamp_entry_fingerprint(conn, int(row["id"]))
+
+
+def get_latest_cumulative_block_hash(conn: sqlite3.Connection) -> str:
+    row = conn.execute(
+        """
+        SELECT cumulative_block_hash
+        FROM journal_entries
+        WHERE cumulative_block_hash IS NOT NULL AND cumulative_block_hash != ''
+        ORDER BY id DESC
+        LIMIT 1
+        """
+    ).fetchone()
+    if row is None:
+        return "GENESIS"
+    return str(row["cumulative_block_hash"])
+
+
+def verify_chain_of_trust(conn: sqlite3.Connection, limit: int = 5000) -> dict[str, Any]:
+    rows = conn.execute(
+        """
+        SELECT id, reference, entry_fingerprint, previous_entry_fingerprint, cumulative_block_hash, created_at
+        FROM journal_entries
+        WHERE status = 'POSTED'
+        ORDER BY id ASC
+        LIMIT ?
+        """,
+        (max(1, min(limit, 50000)),),
+    ).fetchall()
+
+    timeline: list[dict[str, Any]] = []
+    mismatches: list[dict[str, Any]] = []
+    prior_block_hash = "GENESIS"
+    prior_fingerprint = "GENESIS"
+
+    for row in rows:
+        lines = conn.execute(
+            """
+            SELECT account_id, debit, credit
+            FROM journal_lines
+            WHERE entry_id = ?
+            ORDER BY id ASC
+            """,
+            (int(row["id"]),),
+        ).fetchall()
+        expected_fingerprint = build_integrity_hash(str(row["reference"]), lines)
+        expected_block_hash = sha256(f"{prior_block_hash}:{expected_fingerprint}".encode("utf-8")).hexdigest()
+        stored_fingerprint = str(row["entry_fingerprint"] or "")
+        stored_prev = str(row["previous_entry_fingerprint"] or "")
+        stored_block = str(row["cumulative_block_hash"] or "")
+
+        verified = (
+            stored_fingerprint == expected_fingerprint
+            and stored_block == expected_block_hash
+            and (stored_prev == prior_fingerprint or (stored_prev == "GENESIS" and prior_fingerprint == "GENESIS"))
+        )
+
+        item = {
+            "entry_id": int(row["id"]),
+            "reference": str(row["reference"]),
+            "stored_fingerprint": stored_fingerprint,
+            "calculated_fingerprint": expected_fingerprint,
+            "stored_previous_fingerprint": stored_prev,
+            "expected_previous_fingerprint": prior_fingerprint,
+            "stored_block_hash": stored_block,
+            "calculated_block_hash": expected_block_hash,
+            "verified": verified,
+            "created_at": str(row["created_at"] or ""),
+        }
+        timeline.append(item)
+        if not verified:
+            mismatches.append(item)
+
+        prior_fingerprint = expected_fingerprint
+        prior_block_hash = expected_block_hash
+
+    total = len(timeline)
+    verified_count = total - len(mismatches)
+    integrity_score = round((verified_count / total) * 100, 2) if total > 0 else 100.0
+    return {
+        "status": "ok" if len(mismatches) == 0 else "TAMPER_DETECTED",
+        "hash_algorithm": "SHA-256",
+        "total_checked": total,
+        "verified_count": verified_count,
+        "mismatch_count": len(mismatches),
+        "integrity_score": integrity_score,
+        "cumulative_block_hash": prior_block_hash,
+        "timeline": timeline,
+        "mismatches": mismatches,
+    }
 
 
 def generate_tally_export(conn: sqlite3.Connection, entry_id: int) -> tuple[bytes, str, Path, str, str]:
@@ -3231,8 +3534,10 @@ def startup() -> None:
 @app.get("/api/v1/health")
 def get_system_health() -> dict[str, Any]:
     db_exists = SQLITE_DB_PATH.exists()
+    with closing(get_conn()) as conn:
+        chain = verify_chain_of_trust(conn, limit=2000)
     return {
-        "status": "ok",
+        "status": "ok" if chain["status"] == "ok" else "degraded",
         "service": "accord-backend",
         "database": {
             "requested_url": DATABASE_URL,
@@ -3244,8 +3549,26 @@ def get_system_health() -> dict[str, Any]:
                 "PENDING_SQL_DIALECT_MIGRATION" if DB_BACKEND == "postgresql" else "NOT_REQUESTED"
             ),
         },
+        "chain_of_trust": {
+            "status": chain["status"],
+            "cumulative_block_hash": chain["cumulative_block_hash"],
+            "total_checked": chain["total_checked"],
+            "mismatch_count": chain["mismatch_count"],
+        },
         "timestamp": datetime.utcnow().isoformat(timespec="seconds") + "Z",
     }
+
+
+@app.post("/api/v1/ledger/verify-integrity")
+def post_ledger_verify_integrity(
+    limit: int = 8000,
+    x_role: str | None = Header(default=None, alias="X-Role"),
+    x_admin_id: str | None = Header(default=None, alias="X-Admin-Id"),
+) -> dict[str, Any]:
+    require_role(x_role, {"admin", "ca"})
+    require_admin_id(x_admin_id)
+    with closing(get_conn()) as conn:
+        return verify_chain_of_trust(conn, limit=limit)
 
 
 @app.get("/api/v1/insights/friday-health")
@@ -3283,6 +3606,7 @@ async def get_m3_telemetry() -> dict[str, Any]:
     ram_total_gb = 0.0
     cache_disk_free_mb = 0
     active_workers = 0
+    thermal_pressure_pct = 0.0
 
     if psutil is not None:
         try:
@@ -3291,8 +3615,16 @@ async def get_m3_telemetry() -> dict[str, Any]:
             ram_used_gb = round(vm.used / (1024**3), 2)
             ram_total_gb = round(vm.total / (1024**3), 2)
             active_workers = min(MAX_PARALLEL_WORKERS, len(psutil.Process().children(recursive=True)))
+            memory_pressure = (float(vm.percent) if hasattr(vm, "percent") else 0.0)
+            thermal_pressure_pct = round(min(100.0, (cpu_percent * 0.7) + (memory_pressure * 0.3)), 2)
         except Exception:  # noqa: BLE001
             pass
+
+    target_workers = 8
+    if thermal_pressure_pct < 30:
+        target_workers = MAX_PARALLEL_WORKERS
+    elif thermal_pressure_pct > 80:
+        target_workers = 4
 
     try:
         if RAM_DISK_BUFFER.exists():
@@ -3306,8 +3638,10 @@ async def get_m3_telemetry() -> dict[str, Any]:
         "cpu_percent": round(cpu_percent, 2),
         "ram_used_gb": ram_used_gb,
         "ram_total_gb": ram_total_gb,
+        "thermal_pressure_pct": thermal_pressure_pct,
         "neural_engine_active": active_workers > 0,
         "active_workers": active_workers,
+        "adaptive_target_workers": target_workers,
         "max_workers": MAX_PARALLEL_WORKERS,
         "cache_disk_free_mb": cache_disk_free_mb,
         "cache_disk_mounted": RAM_DISK_BUFFER.exists(),
@@ -3468,6 +3802,35 @@ async def upload_photo_to_ledger(
             "entry_fingerprint": fingerprint,
         },
     }
+
+
+@app.post("/api/v1/ledger/mobile-sync")
+async def mobile_sync_to_ledger(
+    file: UploadFile = File(...),
+    x_role: str | None = Header(default=None, alias="X-Role"),
+    x_admin_id: str | None = Header(default=None, alias="X-Admin-Id"),
+) -> dict[str, Any]:
+    """Accepts mobile photo capture and syncs it to the ledger via RAM-disk staging.
+
+    Hardware Impact:
+        Uses RAM-disk staging for low-latency image pipelines on Apple M3.
+    Logic Invariants:
+        Rejects non-image payloads and empty uploads before any ledger mutation.
+    Legal Context:
+        Maintains auditability by preserving extraction metadata and fingerprint continuity.
+    """
+    role = require_role(x_role, {"admin", "ca"})
+    admin_id = require_admin_id(x_admin_id)
+    _, ingest_layer, _, _ = ensure_service_layer()
+
+    raw = await file.read()
+    return await ingest_layer.mobile_sync(
+        filename=file.filename or "",
+        content_type=file.content_type or "",
+        raw=raw,
+        role=role,
+        admin_id=admin_id,
+    )
 
 
 @app.post("/api/v1/ledger/neural-ink")
@@ -4159,6 +4522,7 @@ async def post_reconcile_2b(
 ) -> dict[str, Any]:
     role = require_role(x_role, {"admin", "ca"})
     admin_id = require_admin_id(x_admin_id)
+    _, _, compliance_layer, _ = ensure_service_layer()
 
     if not file.filename:
         raise HTTPException(status_code=400, detail="Missing 2B file name")
@@ -4175,12 +4539,6 @@ async def post_reconcile_2b(
     records_2b = _extract_2b_records(two_b_path)
     if not records_2b:
         raise HTTPException(status_code=422, detail="No valid invoice records found in uploaded 2B payload")
-
-    two_b_index: set[str] = set()
-    for row in records_2b:
-        if row["invoice_reference"]:
-            two_b_index.add(f"{row['gstin']}|{row['invoice_reference']}")
-        two_b_index.add(f"{row['gstin']}|{row['tax_amount']}|{row['invoice_date']}")
 
     with closing(get_conn()) as conn:
         ledger_rows = conn.execute(
@@ -4199,42 +4557,12 @@ async def post_reconcile_2b(
             ORDER BY je.date DESC, je.id DESC
             """
         ).fetchall()
-
-    ghost_invoices: list[dict[str, Any]] = []
-    for row in ledger_rows:
-        gstin = str(row["counterparty_gstin"] or "").strip().upper()
-        if not gstin:
-            continue
-        reference = str(row["reference"])
-        row_date = str(row["date"])
-        tax_amt = money_str(parse_amount_from_text(str(row["tax_amount"])))
-        strong_key = f"{gstin}|{reference}"
-        weak_key = f"{gstin}|{tax_amt}|{row_date}"
-        if strong_key in two_b_index or weak_key in two_b_index:
-            continue
-
-        nudge = await _draft_vendor_nudge_message(
-            vendor_name=str(row["vendor_legal_name"] or "Vendor"),
-            gstin=gstin,
-            invoice_reference=reference,
-            invoice_amount=money_str(parse_amount_from_text(str(row["taxable_value"]))),
-            mismatch_reason="Ledger invoice not found in uploaded GSTR-2B dataset",
-        )
-        ghost_invoices.append(
-            {
-                "entry_id": int(row["id"]),
-                "reference": reference,
-                "date": row_date,
-                "gstin": gstin,
-                "vendor_name": str(row["vendor_legal_name"] or "Vendor"),
-                "tax_amount": tax_amt,
-                "taxable_value": money_str(parse_amount_from_text(str(row["taxable_value"]))),
-                "risk": "GHOST_INVOICE",
-                "nudge_template": nudge,
-            }
-        )
-
-    nexus_graph = _build_nexus_graph([dict(row) for row in ledger_rows])
+    reconciliation = await compliance_layer.reconcile_gstr2b(
+        two_b_path=two_b_path,
+        ledger_rows=[dict(row) for row in ledger_rows],
+    )
+    ghost_invoices = reconciliation["ghost_invoices"]
+    nexus_graph = reconciliation["nexus_graph"]
 
     with closing(get_conn()) as conn:
         conn.execute("BEGIN")
@@ -4259,10 +4587,11 @@ async def post_reconcile_2b(
 
     return {
         "status": "reconciled",
-        "uploaded_records": len(records_2b),
-        "ledger_records": len(ledger_rows),
+        "uploaded_records": reconciliation["uploaded_records"],
+        "ledger_records": reconciliation["ledger_records"],
         "ghost_invoices_count": len(ghost_invoices),
         "ghost_invoices": ghost_invoices,
+        "anomaly_summary": reconciliation.get("anomaly_summary", {}),
         "nexus_graph": nexus_graph,
         "source_file": str(two_b_path),
     }
@@ -4731,6 +5060,183 @@ def export_tally_bulk(
             "X-Batch-Integrity": integrity_hash,
         },
     )
+
+
+@app.post("/api/v1/ledger/tally-sync-final")
+def tally_sync_final(
+    payload: TallySyncFinalIn,
+    x_role: str | None = Header(default=None, alias="X-Role"),
+    x_admin_id: str | None = Header(default=None, alias="X-Admin-Id"),
+) -> Response:
+    role = require_role(x_role, {"admin", "ca"})
+    admin_id = require_admin_id(x_admin_id)
+
+    entry_ids = sorted({int(item) for item in payload.entry_ids if int(item) > 0})
+    if not entry_ids:
+        raise HTTPException(status_code=422, detail="At least one valid entry_id is required")
+
+    with closing(get_conn()) as conn:
+        entries = conn.execute(
+            f"""
+            SELECT id, date, reference, description, status, voucher_type
+            FROM journal_entries
+            WHERE id IN ({','.join('?' * len(entry_ids))})
+            ORDER BY date ASC, id ASC
+            """,
+            tuple(entry_ids),
+        ).fetchall()
+        if len(entries) != len(entry_ids):
+            raise HTTPException(status_code=404, detail="Some requested entries were not found")
+
+        envelope = ET.Element("ENVELOPE")
+        header = ET.SubElement(envelope, "HEADER")
+        ET.SubElement(header, "TALLYREQUEST").text = "Import Data"
+        body = ET.SubElement(envelope, "BODY")
+        import_data = ET.SubElement(body, "IMPORTDATA")
+        request_desc = ET.SubElement(import_data, "REQUESTDESC")
+        ET.SubElement(request_desc, "REPORTNAME").text = "Vouchers"
+        request_data = ET.SubElement(import_data, "REQUESTDATA")
+        tally_message = ET.SubElement(request_data, "TALLYMESSAGE")
+
+        batch_material = []
+        for entry in entries:
+            lines = conn.execute(
+                """
+                SELECT jl.debit, jl.credit, a.name
+                FROM journal_lines jl
+                JOIN accounts a ON a.id = jl.account_id
+                WHERE jl.entry_id = ?
+                ORDER BY jl.id ASC
+                """,
+                (int(entry["id"]),),
+            ).fetchall()
+            if not lines:
+                continue
+
+            image_row = conn.execute(
+                """
+                SELECT file_path
+                FROM receipt_imports
+                WHERE entry_id = ?
+                ORDER BY id DESC
+                LIMIT 1
+                """,
+                (int(entry["id"]),),
+            ).fetchone()
+            image_b64 = ""
+            image_name = ""
+            if image_row is not None:
+                image_path = Path(str(image_row["file_path"]))
+                if image_path.exists():
+                    image_b64 = base64.b64encode(image_path.read_bytes()).decode("utf-8")
+                    image_name = image_path.name
+
+            vch_type = voucher_service.ensure_golden_six(str(entry["voucher_type"] or "JOURNAL")).title()
+            voucher = ET.SubElement(tally_message, "VOUCHER", {"VCHTYPE": vch_type, "ACTION": "Create"})
+            ET.SubElement(voucher, "DATE").text = str(entry["date"]).replace("-", "")
+            ET.SubElement(voucher, "VOUCHERNUMBER").text = str(entry["reference"])
+            ET.SubElement(voucher, "NARRATION").text = str(entry["description"] or "Accord Tally Sync Final")
+
+            udf_voucher = ET.SubElement(voucher, "UDF:Voucher")
+            ET.SubElement(udf_voucher, "UDF:ENTRYID").text = str(entry["id"])
+            ET.SubElement(udf_voucher, "UDF:VOUCHERTYPE").text = vch_type.upper()
+            ET.SubElement(udf_voucher, "UDF:ATTACHMENTNAME").text = image_name
+            ET.SubElement(udf_voucher, "UDF:ATTACHMENTBASE64").text = image_b64
+
+            for line in lines:
+                amount = money(line["debit"]) - money(line["credit"])
+                ledger_entry = ET.SubElement(voucher, "ALLLEDGERENTRIES.LIST")
+                ET.SubElement(ledger_entry, "LEDGERNAME").text = str(line["name"])
+                ET.SubElement(ledger_entry, "ISDEEMEDPOSITIVE").text = "Yes" if amount < 0 else "No"
+                ET.SubElement(ledger_entry, "AMOUNT").text = f"{amount:.4f}"
+
+            batch_material.append(
+                {
+                    "id": int(entry["id"]),
+                    "reference": str(entry["reference"]),
+                    "voucher_type": vch_type.upper(),
+                    "attachment": image_name,
+                }
+            )
+
+        payload_hash = sha256(json.dumps(batch_material, sort_keys=True).encode("utf-8")).hexdigest()
+        xml_bytes = ET.tostring(envelope, encoding="utf-8", xml_declaration=True)
+        filename = f"Accord_Tally_Sync_Final_{datetime.utcnow().strftime('%Y%m%d_%H%M%S')}.xml"
+        TALLY_EXPORT_DIR.mkdir(parents=True, exist_ok=True)
+        export_path = TALLY_EXPORT_DIR / filename
+        export_path.write_bytes(xml_bytes)
+
+        log_audit(
+            conn,
+            table_name="journal_entries",
+            record_id=entry_ids[0],
+            action="TALLY_SYNC_FINAL",
+            old_value=None,
+            new_value={
+                "entry_ids": entry_ids,
+                "entries": len(batch_material),
+                "payload_hash": payload_hash,
+                "export_path": str(export_path),
+                "actor_role": role,
+            },
+            user_id=admin_id,
+            high_priority=True,
+        )
+        conn.commit()
+
+    return Response(
+        content=xml_bytes,
+        media_type="application/xml",
+        headers={
+            "Content-Disposition": f"attachment; filename={filename}",
+            "X-Accord-Export-Path": str(export_path),
+            "X-Accord-Payload-Hash": payload_hash,
+        },
+    )
+
+
+@app.post("/api/v1/inventory/batches")
+def upsert_inventory_batch(
+    payload: InventoryBatchUpsertIn,
+    x_role: str | None = Header(default=None, alias="X-Role"),
+    x_admin_id: str | None = Header(default=None, alias="X-Admin-Id"),
+) -> dict[str, Any]:
+    require_role(x_role, {"admin", "ca"})
+    admin_id = require_admin_id(x_admin_id)
+    _, _, _, inventory_layer = ensure_service_layer()
+
+    try:
+        return inventory_layer.upsert_batch(
+            sku_code=payload.sku_code,
+            sku_name=payload.sku_name,
+            batch_code=payload.batch_code,
+            hsn_code=validate_hsn_code_format(payload.hsn_code),
+            gst_rate=money(payload.gst_rate),
+            quantity=money(payload.quantity),
+            unit_cost=money(payload.unit_cost),
+            expiry_date=payload.expiry_date,
+            created_by=admin_id,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+
+@app.get("/api/v1/inventory/batches")
+def get_inventory_batches(
+    include_expired: bool = True,
+    limit: int = 200,
+    x_role: str | None = Header(default=None, alias="X-Role"),
+    x_admin_id: str | None = Header(default=None, alias="X-Admin-Id"),
+) -> dict[str, Any]:
+    require_role(x_role, {"admin", "ca"})
+    require_admin_id(x_admin_id)
+    _, _, _, inventory_layer = ensure_service_layer()
+    items = inventory_layer.list_batches(include_expired=include_expired, limit=limit)
+    return {
+        "status": "ok",
+        "count": len(items),
+        "items": items,
+    }
 
 
 @app.get("/api/accounts")
