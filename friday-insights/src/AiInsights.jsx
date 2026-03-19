@@ -3,15 +3,21 @@ import {
   AlertTriangle,
   ArrowRight,
   BadgeAlert,
+  BarChart3,
+  Building2,
   Bot,
   BrainCircuit,
   Camera,
   CheckCircle2,
   FileCode2,
+  FileSearch,
   Fingerprint,
+  Handshake,
+  Layers,
   Loader2,
   PanelLeft,
   Radar,
+  Smartphone,
   Sparkles,
   ShieldAlert,
   Zap,
@@ -196,6 +202,7 @@ export default function AiInsights() {
   const [mistralReady, setMistralReady] = useState(false);
   const [telemetry, setTelemetry] = useState(null);
   const [forensicStreamText, setForensicStreamText] = useState("");
+  const [deckMode, setDeckMode] = useState(false);
 
   useEffect(() => {
     if (!fridayAnswer) {
@@ -934,6 +941,23 @@ export default function AiInsights() {
     },
   ];
 
+  const investorKpis = useMemo(() => {
+    const totalRisk = Number(summary?.summary?.total_itc_at_risk ?? 0);
+    const potentialSavings = Number(summary?.summary?.total_potential_interest_savings ?? 0);
+    const vendorsFlagged = Number(summary?.summary?.vendors_flagged ?? topVendors.length ?? 0);
+    const forensicRisk = Number(forensicAudit?.risk_score ?? 0);
+    const cpuLoad = Number(telemetry?.cpu_percent ?? 0);
+    return {
+      totalRisk,
+      potentialSavings,
+      vendorsFlagged,
+      forensicRisk,
+      cpuLoad,
+      activeWorkers: Number(telemetry?.active_workers ?? 0),
+      cacheFreeMb: Number(telemetry?.cache_disk_free_mb ?? 0),
+    };
+  }, [summary, topVendors, forensicAudit, telemetry]);
+
   return (
     <div className="ai-shell min-h-screen bg-black text-white">
       <div className="mx-auto max-w-[96rem] px-4 sm:px-6 lg:px-8 py-8">
@@ -1141,16 +1165,103 @@ export default function AiInsights() {
             <h1 className="text-2xl sm:text-3xl font-bold tracking-tight">Cash-Flow Protection Command Center</h1>
             <p className="text-sm text-slate-400 mt-1">As of {summary?.as_of_date}</p>
           </div>
-          <div className="grid grid-cols-1 sm:grid-cols-2 gap-3 w-full sm:w-auto">
+          <div className="grid grid-cols-1 sm:grid-cols-3 gap-3 w-full sm:w-auto">
             <div className="rounded-xl border border-white/15 bg-black/70 px-4 py-3 glass-panel">
               <p className="text-xs text-slate-400">Potential Interest Savings</p>
               <p className="text-xl font-mono font-bold text-emerald-300">
                 {formatINR(summary?.summary?.total_potential_interest_savings)}
               </p>
             </div>
+            <button
+              onClick={() => setDeckMode((prev) => !prev)}
+              className="rounded-xl border border-cyan-500/40 bg-cyan-900/25 hover:bg-cyan-800/35 px-4 py-3 text-left"
+            >
+              <p className="text-xs text-cyan-200 uppercase tracking-[0.18em]">Investor Mode</p>
+              <p className="text-sm font-semibold mt-1">{deckMode ? "Deck Live" : "Launch Deck"}</p>
+              <p className="text-[11px] text-slate-300 mt-1">Client-ready narrative inside dashboard</p>
+            </button>
             <M3CoreMonitor telemetry={telemetry} neuralActive={neuralEngineActive} mistralReady={mistralReady} />
           </div>
         </header>
+
+        {deckMode ? (
+          <section className="rounded-2xl border border-white/20 bg-black/70 p-5 space-y-5 glass-panel ai-panel ai-reveal" data-delay="2">
+            <div className="flex items-center justify-between gap-3">
+              <div>
+                <p className="text-xs tracking-[0.22em] uppercase text-cyan-300">Accord Sovereign OS Pitch</p>
+                <h2 className="text-xl font-bold mt-1">Investor Deck Components</h2>
+              </div>
+              <span className="text-xs text-slate-400 mono-metrics">BUILD: release/v1.0</span>
+            </div>
+
+            <div className="grid grid-cols-1 md:grid-cols-4 gap-3">
+              <div className="rounded-xl border border-slate-700 bg-slate-950/80 p-3">
+                <p className="text-[11px] text-slate-400">ITC at Risk Covered</p>
+                <p className="text-lg font-semibold text-white mt-1">{formatINR(investorKpis.totalRisk)}</p>
+              </div>
+              <div className="rounded-xl border border-slate-700 bg-slate-950/80 p-3">
+                <p className="text-[11px] text-slate-400">Interest Saved</p>
+                <p className="text-lg font-semibold text-emerald-300 mt-1">{formatINR(investorKpis.potentialSavings)}</p>
+              </div>
+              <div className="rounded-xl border border-slate-700 bg-slate-950/80 p-3">
+                <p className="text-[11px] text-slate-400">Worker Saturation</p>
+                <p className="text-lg font-semibold text-cyan-300 mt-1 mono-metrics">{investorKpis.activeWorkers}/10</p>
+              </div>
+              <div className="rounded-xl border border-slate-700 bg-slate-950/80 p-3">
+                <p className="text-[11px] text-slate-400">Forensic Risk Score</p>
+                <p className="text-lg font-semibold text-amber-300 mt-1 mono-metrics">{Math.round(investorKpis.forensicRisk)}</p>
+              </div>
+            </div>
+
+            <div className="grid grid-cols-1 lg:grid-cols-3 gap-4">
+              <div className="rounded-xl border border-slate-700 bg-slate-950/80 p-4">
+                <div className="flex items-center gap-2">
+                  <Layers className="w-4 h-4 text-cyan-300" />
+                  <p className="text-sm font-semibold">Technology Moat</p>
+                </div>
+                <p className="text-xs text-slate-400 mt-2">Llava + Llama3.2 + Mistral on-device with ledger fingerprinting and zero-float drift.</p>
+              </div>
+              <div className="rounded-xl border border-slate-700 bg-slate-950/80 p-4">
+                <div className="flex items-center gap-2">
+                  <Building2 className="w-4 h-4 text-emerald-300" />
+                  <p className="text-sm font-semibold">India Compliance Edge</p>
+                </div>
+                <p className="text-xs text-slate-400 mt-2">Rule 37A reversal shield + Section 50(3) Safe Harbor certificates + CA-grade audit trail.</p>
+              </div>
+              <div className="rounded-xl border border-slate-700 bg-slate-950/80 p-4">
+                <div className="flex items-center gap-2">
+                  <BarChart3 className="w-4 h-4 text-amber-300" />
+                  <p className="text-sm font-semibold">Hardware Throughput</p>
+                </div>
+                <p className="text-xs text-slate-400 mt-2">CPU {Math.round(investorKpis.cpuLoad)}% | Cache Free {investorKpis.cacheFreeMb} MB | 10-worker OCR pipeline.</p>
+              </div>
+            </div>
+
+            <div className="grid grid-cols-1 lg:grid-cols-3 gap-4">
+              <div className="rounded-xl border border-cyan-900/60 bg-black/75 p-4">
+                <div className="flex items-center gap-2">
+                  <Handshake className="w-4 h-4 text-cyan-300" />
+                  <p className="text-sm font-semibold">Next: CA Network</p>
+                </div>
+                <p className="text-xs text-slate-400 mt-2">Onboard first 10 CAs with Safe Harbor one-click certification and monthly compliance cockpit.</p>
+              </div>
+              <div className="rounded-xl border border-cyan-900/60 bg-black/75 p-4">
+                <div className="flex items-center gap-2">
+                  <Smartphone className="w-4 h-4 text-cyan-300" />
+                  <p className="text-sm font-semibold">Next: Mobile Ghost-Ledger</p>
+                </div>
+                <p className="text-xs text-slate-400 mt-2">Use iOS shell to ship camera-first Neural-Ink receipt capture with direct Tally bridge sync.</p>
+              </div>
+              <div className="rounded-xl border border-cyan-900/60 bg-black/75 p-4">
+                <div className="flex items-center gap-2">
+                  <FileSearch className="w-4 h-4 text-cyan-300" />
+                  <p className="text-sm font-semibold">Next: GSTR-2B Reconciler</p>
+                </div>
+                <p className="text-xs text-slate-400 mt-2">Automate missing invoice detection and trigger WhatsApp nudge workflow for vendor compliance.</p>
+              </div>
+            </div>
+          </section>
+        ) : null}
 
         <section className="grid grid-cols-1 xl:grid-cols-[320px_minmax(0,1fr)] gap-6 ai-panel ai-reveal" data-delay="2">
           <div className="rounded-2xl border border-cyan-500/25 bg-slate-900/50 p-5 flex flex-col items-center justify-center gap-3">
