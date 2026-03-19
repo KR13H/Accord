@@ -93,6 +93,9 @@ OLLAMA_GENERATE_URL = f"{OLLAMA_HOST}/api/generate"
 VISION_MODEL = os.getenv("ACCORD_VISION_MODEL", "llava")
 RECON_MODEL = os.getenv("ACCORD_RECON_MODEL", "llama3.2")
 FORENSIC_MODEL = os.getenv("ACCORD_FORENSIC_MODEL", "mistral")
+DEPLOYMENT_MODE = os.getenv("ACCORD_DEPLOYMENT_MODE", "sovereign-local").strip().lower() or "sovereign-local"
+BACKEND_PUBLIC_URL = os.getenv("BACKEND_PUBLIC_URL", "").strip()
+FRONTEND_PUBLIC_URL = os.getenv("FRONTEND_PUBLIC_URL", "").strip()
 SMTP_HOST = os.getenv("ACCORD_SMTP_HOST", "")
 SMTP_PORT = int(os.getenv("ACCORD_SMTP_PORT", "587"))
 SMTP_USERNAME = os.getenv("ACCORD_SMTP_USERNAME", "")
@@ -3574,6 +3577,21 @@ def get_system_health() -> dict[str, Any]:
             "total_checked": chain["total_checked"],
             "mismatch_count": chain["mismatch_count"],
         },
+        "timestamp": datetime.utcnow().isoformat(timespec="seconds") + "Z",
+    }
+
+
+@app.get("/api/v1/system/deployment-info")
+def get_deployment_info() -> dict[str, Any]:
+    return {
+        "status": "ok",
+        "deployment_mode": DEPLOYMENT_MODE,
+        "backend_public_url": BACKEND_PUBLIC_URL,
+        "frontend_public_url": FRONTEND_PUBLIC_URL,
+        "database_backend": DB_BACKEND,
+        "postgres_runtime_status": "PENDING_SQL_DIALECT_MIGRATION" if DB_BACKEND == "postgresql" else "NOT_REQUESTED",
+        "cors_allow_origins": cors_allow_origins,
+        "cors_allow_origin_regex": cors_allow_origin_regex,
         "timestamp": datetime.utcnow().isoformat(timespec="seconds") + "Z",
     }
 

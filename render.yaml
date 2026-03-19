@@ -11,6 +11,12 @@ services:
     envVars:
       - key: DATABASE_URL
         sync: false
+      - key: ACCORD_DEPLOYMENT_MODE
+        value: cloud
+      - key: BACKEND_PUBLIC_URL
+        value: https://accord-logic.onrender.com
+      - key: FRONTEND_PUBLIC_URL
+        value: https://accord-stark.vercel.app
       - key: CORS_ALLOW_ORIGINS
         value: https://accord-stark.vercel.app,http://localhost:5173,http://127.0.0.1:5173
       - key: CORS_ALLOW_ORIGIN_REGEX
