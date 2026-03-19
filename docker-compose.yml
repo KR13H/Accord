@@ -21,6 +21,7 @@ services:
       context: ./cloud-backend
     container_name: accord-backend
     environment:
+      OLLAMA_HOST: ${OLLAMA_HOST:-http://host.docker.internal:11434}
       GSTN_ECL_BASE_URL: ""
       GSTN_ECL_TOKEN: ""
       ACCORD_BIOMETRIC_SECRET: "change-this-in-production"

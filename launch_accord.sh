@@ -29,7 +29,12 @@ if ! command -v ollama >/dev/null 2>&1; then
 fi
 
 echo "[Accord] Ensuring Ollama model is available (llama3.2)..."
-ollama pull llama3.2 >/dev/null
+if ! ollama list 2>/dev/null | awk '{print $1}' | grep -Eq '^llama3\.2(:|$)'; then
+  echo "[Accord] llama3.2 not found locally. Pulling model..."
+  ollama pull llama3.2 >/dev/null
+else
+  echo "[Accord] llama3.2 already present."
+fi
 
 if ! curl -fsS "http://localhost:11434/api/tags" >/dev/null 2>&1; then
   echo "[Accord] Starting Ollama service in background..."
@@ -39,7 +44,12 @@ fi
 
 echo "[Accord] Launching Docker stack (Postgres + Backend + Frontend)..."
 if docker info >/dev/null 2>&1; then
-  docker compose up --build -d
+  if [[ "${FORCE_BUILD:-0}" == "1" ]]; then
+    echo "[Accord] FORCE_BUILD=1 set. Rebuilding images..."
+    docker compose up --build -d
+  else
+    docker compose up -d
+  fi
   FRONTEND_URL="http://localhost:3000"
   BACKEND_URL="http://localhost:8000"
 else
