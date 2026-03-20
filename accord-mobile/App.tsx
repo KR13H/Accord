@@ -12,9 +12,14 @@ import {
   View,
   useWindowDimensions,
 } from "react-native";
+import { PaperProvider, Button, Card, TextInput as PaperTextInput, Paragraph, Title, Snackbar, ActivityIndicator } from "react-native-paper";
 import Voice from "@react-native-voice/voice";
 import * as SecureStore from "expo-secure-store";
 import NetInfo from "@react-native-community/netinfo";
+import Animated from "react-native-reanimated";
+import { AccordDarkTheme, Spacing } from "./AccordTheme";
+import { Skeleton } from "./components/SkeletonLoader";
+import { usePulsingAnimation, useWaveAnimation, useFadeAnimation } from "./hooks/useVoiceAnimations";
 
 type Txn = {
   payment_id: string;
@@ -568,9 +573,10 @@ export default function App() {
   };
 
   return (
-    <SafeAreaView style={styles.root}>
-      <StatusBar barStyle="light-content" />
-      <ScrollView contentContainerStyle={styles.container}>
+    <PaperProvider theme={AccordDarkTheme}>
+      <SafeAreaView style={styles.root}>
+        <StatusBar barStyle="light-content" backgroundColor={AccordDarkTheme.colors.background} />
+        <ScrollView contentContainerStyle={styles.container}>
         <Text style={styles.title}>Accord Network Mobile</Text>
         <Text style={styles.subtitle}>iOS + Android, phone + tablet, CA approvals and UPI tax flow</Text>
 
@@ -678,7 +684,8 @@ export default function App() {
           <Text style={styles.log}>{log}</Text>
         </View>
       </ScrollView>
-    </SafeAreaView>
+      </SafeAreaView>
+    </PaperProvider>
   );
 }
 
