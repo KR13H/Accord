@@ -44,14 +44,27 @@ fi
 
 echo "[Accord] Launching Docker stack (Postgres + Backend + Frontend)..."
 if docker info >/dev/null 2>&1; then
-  if [[ "${FORCE_BUILD:-0}" == "1" ]]; then
+  if [[ "${ACCORD_USE_PROD_COMPOSE:-0}" == "1" ]]; then
+    PROD_ENV_FILE="${ACCORD_PROD_ENV_FILE:-$ROOT_DIR/.env.production}"
+    if [[ ! -f "$PROD_ENV_FILE" ]]; then
+      echo "[Accord] ERROR: ACCORD_USE_PROD_COMPOSE=1 but env file not found: $PROD_ENV_FILE"
+      echo "[Accord] Copy .env.production.example to .env.production and set required secrets."
+      exit 1
+    fi
+    echo "[Accord] Using production compose stack with Redis realtime bus..."
+    docker compose --env-file "$PROD_ENV_FILE" -f "$ROOT_DIR/docker-compose.prod.yml" up --build -d
+    FRONTEND_URL="http://localhost:3000"
+    BACKEND_URL="http://localhost:8000"
+  elif [[ "${FORCE_BUILD:-0}" == "1" ]]; then
     echo "[Accord] FORCE_BUILD=1 set. Rebuilding images..."
     docker compose up --build -d
+    FRONTEND_URL="http://localhost:3000"
+    BACKEND_URL="http://localhost:8000"
   else
     docker compose up -d
+    FRONTEND_URL="http://localhost:3000"
+    BACKEND_URL="http://localhost:8000"
   fi
-  FRONTEND_URL="http://localhost:3000"
-  BACKEND_URL="http://localhost:8000"
 else
   echo "[Accord] Docker daemon unavailable. Falling back to local runtime..."
   (

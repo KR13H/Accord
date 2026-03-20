@@ -1,0 +1,253 @@
+name: Build & Deploy to Cloud
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+env:
+  REGISTRY: docker.io
+  BACKEND_IMAGE: ${{ secrets.DOCKER_USERNAME }}/accord-backend
+  FRONTEND_IMAGE: ${{ secrets.DOCKER_USERNAME }}/accord-frontend
+
+jobs:
+  test:
+    name: Test & Validate
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: "pip"
+
+      - name: Install backend dependencies
+        run: |
+          cd cloud-backend
+          pip install -r requirements.txt
+
+      - name: Syntax check backend
+        run: |
+          cd cloud-backend
+          python -m py_compile main.py services/*.py
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: "npm"
+          cache-dependency-path: friday-insights/package-lock.json
+
+      - name: Install frontend dependencies
+        run: |
+          cd friday-insights
+          npm ci
+
+      - name: Build frontend
+        run: |
+          cd friday-insights
+          npm run build
+
+      - name: Frontend build artifact check
+        run: |
+          if [ ! -d "friday-insights/dist" ]; then
+            echo "Frontend build produced no dist directory"
+            exit 1
+          fi
+          echo "Frontend build successful, dist size: $(du -sh friday-insights/dist | cut -f1)"
+
+  build:
+    name: Build & Push Docker Images
+    needs: test
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKER_USERNAME }}
+          password: ${{ secrets.DOCKER_PASSWORD }}
+
+      - name: Extract metadata for backend
+        id: meta_backend
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.BACKEND_IMAGE }}
+          tags: |
+            type=ref,event=branch
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=sha,prefix={{branch}}-
+            type=raw,value=latest
+
+      - name: Build and push backend
+        uses: docker/build-push-action@v5
+        with:
+          context: ./cloud-backend
+          push: true
+          tags: ${{ steps.meta_backend.outputs.tags }}
+          labels: ${{ steps.meta_backend.outputs.labels }}
+          cache-from: type=registry,ref=${{ env.REGISTRY }}/${{ env.BACKEND_IMAGE }}:buildcache
+          cache-to: type=registry,ref=${{ env.REGISTRY }}/${{ env.BACKEND_IMAGE }}:buildcache,mode=max
+
+      - name: Extract metadata for frontend
+        id: meta_frontend
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.FRONTEND_IMAGE }}
+          tags: |
+            type=ref,event=branch
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=sha,prefix={{branch}}-
+            type=raw,value=latest
+
+      - name: Build and push frontend
+        uses: docker/build-push-action@v5
+        with:
+          context: ./friday-insights
+          push: true
+          tags: ${{ steps.meta_frontend.outputs.tags }}
+          labels: ${{ steps.meta_frontend.outputs.labels }}
+          cache-from: type=registry,ref=${{ env.REGISTRY }}/${{ env.FRONTEND_IMAGE }}:buildcache
+          cache-to: type=registry,ref=${{ env.REGISTRY }}/${{ env.FRONTEND_IMAGE }}:buildcache,mode=max
+
+  deploy:
+    name: Deploy to Cloud Server
+    needs: build
+    runs-on: ubuntu-latest
+    if: github.ref == 'refs/heads/main'
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Deploy via SSH
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ secrets.DEPLOY_HOST }}
+          username: ${{ secrets.DEPLOY_USER }}
+          key: ${{ secrets.DEPLOY_SSH_KEY }}
+          port: 22
+          script: |
+            set -euo pipefail
+            
+            # Navigate to deployment directory
+            cd ${{ secrets.DEPLOY_DIR }}/Accord || {
+              echo "Deployment directory not found: ${{ secrets.DEPLOY_DIR }}/Accord"
+              exit 1
+            }
+            
+            # Pull latest code
+            echo "[deploy] Pulling latest code from main branch..."
+            git fetch origin main
+            git checkout main
+            git pull origin main
+            
+            # Load environment variables
+            if [ -f .env.production ]; then
+              echo "[deploy] Loading .env.production"
+              export $(grep -v '^#' .env.production | xargs)
+            else
+              echo "[deploy] Warning: .env.production not found"
+            fi
+            
+            # Log in to Docker Hub
+            echo "[deploy] Logging in to Docker Hub..."
+            echo "${{ secrets.DOCKER_PASSWORD }}" | docker login -u "${{ secrets.DOCKER_USERNAME }}" --password-stdin
+            
+            # Pull latest images
+            echo "[deploy] Pulling latest Docker images..."
+            docker pull ${{ env.REGISTRY }}/${{ env.BACKEND_IMAGE }}:latest
+            docker pull ${{ env.REGISTRY }}/${{ env.FRONTEND_IMAGE }}:latest
+            
+            # Stop existing stack (graceful shutdown)
+            echo "[deploy] Stopping existing services..."
+            docker compose -f docker-compose.prod.yml down --remove-orphans || true
+            
+            # Update docker-compose to use latest images
+            echo "[deploy] Starting new services..."
+            docker compose \
+              -f docker-compose.prod.yml \
+              -e ACCORD_BACKEND_IMAGE=${{ env.REGISTRY }}/${{ env.BACKEND_IMAGE }}:latest \
+              -e ACCORD_FRONTEND_IMAGE=${{ env.REGISTRY }}/${{ env.FRONTEND_IMAGE }}:latest \
+              up -d
+            
+            # Wait for backend health
+            echo "[deploy] Waiting for backend to be healthy..."
+            for i in {1..60}; do
+              if curl -fsS "http://localhost:8000/api/v1/health" >/dev/null 2>&1; then
+                echo "[deploy] Backend is healthy"
+                break
+              fi
+              echo "[deploy] Health check $i/60..."
+              sleep 2
+              if [[ "$i" -eq 60 ]]; then
+                echo "[deploy] Backend failed to become healthy"
+                docker compose -f docker-compose.prod.yml logs backend --tail 50
+                exit 1
+              fi
+            done
+            
+            # Verify frontend is responding
+            echo "[deploy] Checking frontend response..."
+            if curl -fsS "http://localhost:3000/" >/dev/null 2>&1; then
+              echo "[deploy] Frontend is responding"
+            else
+              echo "[deploy] Warning: Frontend may not be responding yet"
+            fi
+            
+            echo "[deploy] ✅ Deployment complete!"
+            echo "[deploy] Backend:  http://localhost:8000/api/v1/health"
+            echo "[deploy] Frontend: http://localhost:3000"
+            
+            # Cleanup Docker login
+            docker logout
+
+      - name: Slack Notification (Success)
+        if: success()
+        uses: slackapi/slack-github-action@v1.24.0
+        with:
+          webhook-url: ${{ secrets.SLACK_WEBHOOK }}
+          payload: |
+            {
+              "text": "✅ Accord deployed successfully",
+              "blocks": [
+                {
+                  "type": "section",
+                  "text": {
+                    "type": "mrkdwn",
+                    "text": "*Accord Deployment Successful* 🚀\nBranch: `main`\nCommit: `${{ github.sha }}`\nAuthor: ${{ github.actor }}"
+                  }
+                }
+              ]
+            }
+
+      - name: Slack Notification (Failure)
+        if: failure()
+        uses: slackapi/slack-github-action@v1.24.0
+        with:
+          webhook-url: ${{ secrets.SLACK_WEBHOOK }}
+          payload: |
+            {
+              "text": "❌ Accord deployment failed",
+              "blocks": [
+                {
+                  "type": "section",
+                  "text": {
+                    "type": "mrkdwn",
+                    "text": "*Accord Deployment Failed* ⚠️\nBranch: `main`\nCommit: `${{ github.sha }}`\nAuthor: ${{ github.actor }}\nCheck: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+                  }
+                }
+              ]
+            }

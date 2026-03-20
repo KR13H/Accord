@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useState } from "react";
 import { Fingerprint, FileText, Loader2, ShieldCheck } from "lucide-react";
 import { AnimatePresence, motion } from "framer-motion";
+import NetworkOnboarding from "./NetworkOnboarding";
 
 function formatDateTime(value) {
   if (!value) return "-";
@@ -208,6 +209,8 @@ export default function CaDashboard() {
             </div>
           </div>
         </div>
+
+        <NetworkOnboarding network={network} />
 
         <div className="p-6 bg-slate-900/40 border border-slate-800 rounded-2xl">
           <h3 className="text-lg font-bold mb-4 flex items-center gap-2">

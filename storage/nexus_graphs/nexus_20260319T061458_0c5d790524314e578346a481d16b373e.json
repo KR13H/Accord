@@ -1,0 +1,10 @@
+{
+  "nodes": [
+    {
+      "id": "ACCORD_BUYER",
+      "kind": "anchor"
+    }
+  ],
+  "edges": [],
+  "risk_clusters": []
+}

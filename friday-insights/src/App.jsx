@@ -5,10 +5,16 @@ import Dashboard from "./Dashboard";
 import AiInsights from "./AiInsights";
 import Ledger from "./Ledger";
 import CaDashboard from "./CaDashboard";
+import CAHeatmap from "./CAHeatmap";
 import CaAccept from "./CaAccept";
 import Pricing from "./Pricing";
 import Signup from "./Signup";
 import ReportsCenter from "./ReportsCenter";
+import StarkStudio from "./StarkStudio";
+import DraggableDashboard from "./DraggableDashboard";
+import BalanceSheet from "./BalanceSheet";
+import ProfitAndLoss from "./ProfitAndLoss";
+import GstFiling from "./GstFiling";
 
 const NAV_ITEMS = [
   { to: "/", label: "Home" },
@@ -17,8 +23,14 @@ const NAV_ITEMS = [
   { to: "/ledger", label: "Ledger" },
   { to: "/insights", label: "Friday" },
   { to: "/reports", label: "Reports" },
+  { to: "/drag", label: "Drag" },
+  { to: "/balance-sheet", label: "BS" },
+  { to: "/profit-loss", label: "P&L" },
+  { to: "/gst-filing", label: "GST" },
+  { to: "/studio", label: "Studio" },
   { to: "/signup", label: "Signup" },
   { to: "/ca/dashboard", label: "CA" },
+  { to: "/ca/heatmap", label: "Heatmap" },
 ];
 
 function TopRail() {
@@ -101,8 +113,14 @@ function App() {
             <Route path="/ledger" element={<Ledger />} />
             <Route path="/insights" element={<AiInsights />} />
             <Route path="/reports" element={<ReportsCenter />} />
+            <Route path="/drag" element={<DraggableDashboard />} />
+            <Route path="/balance-sheet" element={<BalanceSheet />} />
+            <Route path="/profit-loss" element={<ProfitAndLoss />} />
+            <Route path="/gst-filing" element={<GstFiling />} />
+            <Route path="/studio" element={<StarkStudio />} />
             <Route path="/signup" element={<Signup />} />
             <Route path="/ca/dashboard" element={<CaDashboard />} />
+            <Route path="/ca/heatmap" element={<CAHeatmap />} />
             <Route path="/ca/accept/:token" element={<CaAccept />} />
             <Route path="*" element={<Navigate to="/" replace />} />
           </Routes>

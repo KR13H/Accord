@@ -1,0 +1,30 @@
+{
+  "expo": {
+    "name": "Accord Mobile",
+    "slug": "accord-mobile",
+    "version": "0.1.0",
+    "orientation": "default",
+    "userInterfaceStyle": "automatic",
+    "assetBundlePatterns": [
+      "**/*"
+    ],
+    "ios": {
+      "supportsTablet": true,
+      "bundleIdentifier": "com.accord.mobile",
+      "infoPlist": {
+        "NSMicrophoneUsageDescription": "Accord uses microphone input to convert spoken accounting commands into ledger entries.",
+        "NSSpeechRecognitionUsageDescription": "Accord uses speech recognition to parse voice commands for GST and ledger workflows."
+      }
+    },
+    "android": {
+      "package": "com.accord.mobile",
+      "adaptiveIcon": {
+        "backgroundColor": "#0B1220"
+      },
+      "permissions": [
+        "android.permission.RECORD_AUDIO"
+      ]
+    },
+    "plugins": []
+  }
+}
