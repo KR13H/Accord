@@ -1,0 +1,57 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://accord.local/contracts/rera/allocation-request.schema.json",
+  "title": "RERAAllocationRequest",
+  "type": "object",
+  "required": [
+    "booking_id",
+    "payment_reference",
+    "event_type",
+    "receipt_amount",
+    "actor_role"
+  ],
+  "properties": {
+    "booking_id": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 64
+    },
+    "payment_reference": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 80
+    },
+    "event_type": {
+      "type": "string",
+      "enum": ["PAYMENT", "REFUND"]
+    },
+    "receipt_amount": {
+      "type": "string",
+      "pattern": "^\\d+(\\.\\d{1,2})?$"
+    },
+    "override_rera_ratio": {
+      "type": ["string", "null"],
+      "pattern": "^0(\\.\\d{1,4})?$|^1(\\.0{1,4})?$"
+    },
+    "override_reason": {
+      "type": ["string", "null"],
+      "maxLength": 256
+    },
+    "actor_role": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 40
+    }
+  },
+  "allOf": [
+    {
+      "if": {
+        "required": ["override_rera_ratio"]
+      },
+      "then": {
+        "required": ["override_reason"]
+      }
+    }
+  ],
+  "additionalProperties": false
+}

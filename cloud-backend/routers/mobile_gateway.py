@@ -23,6 +23,7 @@ MOBILE_SESSIONS: dict[str, dict[str, Any]] = {}
 SME_CA_LINKS: dict[int, dict[str, Any]] = {}
 UPI_TRANSACTIONS: dict[str, dict[str, Any]] = {}
 VOICE_STREAM_SESSIONS: dict[str, dict[str, Any]] = {}
+VOICE_OFFLINE_IDEMPOTENCY: dict[str, dict[str, Any]] = {}
 ALGO_SERVICE = TallyAlgorithmsService()
 VOICE_SYNC_URL = os.getenv("VOICE_SYNC_URL", "http://127.0.0.1:8000/api/v1/ledger/voice-sync").strip()
 
@@ -103,6 +104,18 @@ class VoiceCommitIn(BaseModel):
     session_id: str = Field(min_length=8, max_length=120)
     currency_code: str | None = Field(default=None, min_length=3, max_length=3)
     exchange_rate: Decimal | None = Field(default=None, gt=0)
+
+
+class OfflineVoiceSyncIn(BaseModel):
+    idempotency_key: str = Field(min_length=8, max_length=120)
+    transcript: str = Field(min_length=2, max_length=8000)
+    currency_code: str | None = Field(default=None, min_length=3, max_length=3)
+    exchange_rate: Decimal | None = Field(default=None, gt=0)
+    client_created_at: str | None = Field(default=None, max_length=80)
+
+
+class OfflineVoiceBulkSyncIn(BaseModel):
+    entries: list[OfflineVoiceSyncIn] = Field(min_length=1, max_length=200)
 
 
 def require_mobile_actor(x_role: str | None, x_admin_id: str | None) -> int:
@@ -483,6 +496,118 @@ async def post_voice_session_commit(
         "pipeline": "V2.4_VOICE_SYNC",
         "transcript": transcript,
         "ledger_result": sync_result,
+    }
+
+
+@router.post("/voice/offline/sync")
+async def post_voice_offline_sync(
+    payload: OfflineVoiceSyncIn,
+    x_role: str | None = Header(default=None, alias="X-Role"),
+    x_admin_id: str | None = Header(default=None, alias="X-Admin-Id"),
+) -> dict[str, Any]:
+    role = (x_role or "admin").strip().lower()
+    admin_id = str(require_mobile_actor(x_role, x_admin_id))
+    key = payload.idempotency_key.strip()
+
+    cached = VOICE_OFFLINE_IDEMPOTENCY.get(key)
+    if cached is not None:
+        return {
+            "status": "ok",
+            "idempotent": True,
+            "idempotency_key": key,
+            "ledger_result": cached.get("ledger_result"),
+            "synced_at": cached.get("synced_at"),
+        }
+
+    sync_result = await _forward_voice_sync(
+        transcript=payload.transcript.strip(),
+        x_role=role,
+        x_admin_id=admin_id,
+        currency_code=payload.currency_code,
+        exchange_rate=payload.exchange_rate,
+    )
+    synced_at = datetime.utcnow().isoformat(timespec="seconds") + "Z"
+    VOICE_OFFLINE_IDEMPOTENCY[key] = {
+        "idempotency_key": key,
+        "ledger_result": sync_result,
+        "synced_at": synced_at,
+        "client_created_at": payload.client_created_at,
+    }
+
+    return {
+        "status": "ok",
+        "idempotent": False,
+        "idempotency_key": key,
+        "ledger_result": sync_result,
+        "synced_at": synced_at,
+    }
+
+
+@router.post("/voice/offline/sync/bulk")
+async def post_voice_offline_sync_bulk(
+    payload: OfflineVoiceBulkSyncIn,
+    x_role: str | None = Header(default=None, alias="X-Role"),
+    x_admin_id: str | None = Header(default=None, alias="X-Admin-Id"),
+) -> dict[str, Any]:
+    role = (x_role or "admin").strip().lower()
+    admin_id = str(require_mobile_actor(x_role, x_admin_id))
+
+    results: list[dict[str, Any]] = []
+    for entry in payload.entries:
+        key = entry.idempotency_key.strip()
+        cached = VOICE_OFFLINE_IDEMPOTENCY.get(key)
+        if cached is not None:
+            results.append(
+                {
+                    "idempotency_key": key,
+                    "status": "ok",
+                    "idempotent": True,
+                    "ledger_result": cached.get("ledger_result"),
+                    "synced_at": cached.get("synced_at"),
+                }
+            )
+            continue
+
+        try:
+            sync_result = await _forward_voice_sync(
+                transcript=entry.transcript.strip(),
+                x_role=role,
+                x_admin_id=admin_id,
+                currency_code=entry.currency_code,
+                exchange_rate=entry.exchange_rate,
+            )
+            synced_at = datetime.utcnow().isoformat(timespec="seconds") + "Z"
+            VOICE_OFFLINE_IDEMPOTENCY[key] = {
+                "idempotency_key": key,
+                "ledger_result": sync_result,
+                "synced_at": synced_at,
+                "client_created_at": entry.client_created_at,
+            }
+            results.append(
+                {
+                    "idempotency_key": key,
+                    "status": "ok",
+                    "idempotent": False,
+                    "ledger_result": sync_result,
+                    "synced_at": synced_at,
+                }
+            )
+        except HTTPException as exc:
+            results.append(
+                {
+                    "idempotency_key": key,
+                    "status": "error",
+                    "detail": str(exc.detail),
+                }
+            )
+
+    ok_count = len([item for item in results if item.get("status") == "ok"])
+    return {
+        "status": "ok",
+        "requested": len(payload.entries),
+        "synced": ok_count,
+        "failed": len(payload.entries) - ok_count,
+        "results": results,
     }
 
 

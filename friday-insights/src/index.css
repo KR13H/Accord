@@ -42,3 +42,32 @@ body {
 .mono-metrics {
 	font-family: "JetBrains Mono", ui-monospace, monospace;
 }
+
+.simple-mode {
+	font-size: 18px;
+	line-height: 1.7;
+}
+
+.simple-mode p,
+.simple-mode span,
+.simple-mode a,
+.simple-mode button,
+.simple-mode li,
+.simple-mode label {
+	font-size: 1.02em;
+}
+
+.simple-mode h1 {
+	font-size: clamp(2.3rem, 7vw, 4.2rem);
+	line-height: 1.15;
+}
+
+.simple-mode h2 {
+	font-size: clamp(1.6rem, 4.8vw, 2.7rem);
+}
+
+.simple-mode :focus-visible {
+	outline: 3px solid #22d3ee;
+	outline-offset: 3px;
+	border-radius: 8px;
+}

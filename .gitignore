@@ -56,3 +56,9 @@ storage/audit_vault/*
 .coverage
 htmlcov/
 .pytest_cache/
+
+# Mobile cache noise
+accord-mobile/.expo/
+accord-mobile/.npm/
+accord-mobile/.npm-cache/
+accord-mobile/node_modules.bak*/

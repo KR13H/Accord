@@ -14,6 +14,7 @@ import secrets
 import shutil
 import time
 import uuid
+import tracemalloc
 from contextlib import closing
 from datetime import date, datetime, timedelta
 from decimal import Decimal
@@ -26,7 +27,7 @@ import xml.etree.ElementTree as ET
 from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
 from email.message import EmailMessage
 
-from fastapi import BackgroundTasks, FastAPI, File, Header, HTTPException, Request, UploadFile
+from fastapi import BackgroundTasks, Depends, FastAPI, File, Header, HTTPException, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, Response, StreamingResponse
 from fastapi.routing import APIRoute
@@ -46,19 +47,35 @@ if str(CURRENT_DIR) not in sys.path:
     sys.path.insert(0, str(CURRENT_DIR))
 
 from services.accounting_service import AccountingService
+from services.ai_variance_analyzer import AiVarianceAnalyzer
+from services.banking_service import BankingService
 from services.compliance_service import ComplianceService
+from services.commission_service import CommissionService
 from services.currency_service import CurrencyService
 from services.demo_service import reset_demo_environment
 from services.govt_bridge_service import GovtBridgeService
 from services.gst_service import GstService
 from services.ingest_service import IngestService
 from services.inventory_service import InventoryService
+from services.report_service import ReportService
+from services.rera_allocation_service import AllocationInput, ReraAllocationService
 from services.realtime_events import ca_event_bus
 from services.statutory_service import StatutoryService
 from services.telemetry_service import TelemetryService
 from services.voice_service import VoiceService
 from services.voucher_service import VoucherService
+from middleware.audit_logger import register_audit_logger_middleware
+from middleware.rbac import enforce_rbac_policy
+from routes.booking_routes import create_booking_router
+from routes.chat_routes import create_chat_router
+from routes.invoice_routes import create_invoice_router
+from routes.portal_routes import create_portal_router
+from routes.support_routes import router as support_router
+from routes.tds_routes import create_phase7_router
+from routes.vendor_routes import create_vendor_router
+from routes.webhook_routes import create_webhook_router
 from routers.mobile_gateway import router as mobile_gateway_router
+from utils.throttle import rate_limit_heavy_task
 
 
 DB_PATH = Path(__file__).with_name("ledger.db")
@@ -110,6 +127,7 @@ OLLAMA_GENERATE_URL = f"{OLLAMA_HOST}/api/generate"
 VISION_MODEL = os.getenv("ACCORD_VISION_MODEL", "llava")
 RECON_MODEL = os.getenv("ACCORD_RECON_MODEL", "llama3:8b")
 FORENSIC_MODEL = os.getenv("ACCORD_FORENSIC_MODEL", "mistral")
+VARIANCE_MODEL = os.getenv("ACCORD_VARIANCE_MODEL", RECON_MODEL)
 DEPLOYMENT_MODE = os.getenv("ACCORD_DEPLOYMENT_MODE", "sovereign-local").strip().lower() or "sovereign-local"
 BACKEND_PUBLIC_URL = os.getenv("BACKEND_PUBLIC_URL", "").strip()
 FRONTEND_PUBLIC_URL = os.getenv("FRONTEND_PUBLIC_URL", "").strip()
@@ -133,6 +151,8 @@ MARKET_UPLOAD_DIR = MARKET_INTEL_DIR / "uploads"
 MARKET_REPORT_DIR = MARKET_INTEL_DIR / "reports"
 RAM_DISK_BUFFER = Path("/Volumes/AccordCache/receipt_buffer")
 MAX_PARALLEL_WORKERS = 16  # M3 adaptive upper bound for mixed I/O + OCR workloads
+ENABLE_TRACEMALLOC = os.getenv("ACCORD_ENABLE_TRACEMALLOC", "0").strip().lower() in {"1", "true", "yes"}
+TRACEMALLOC_FRAMES = int(os.getenv("ACCORD_TRACEMALLOC_FRAMES", "25"))
 
 CORS_DEFAULT_ORIGINS = [
     "http://localhost:5173",
@@ -192,6 +212,7 @@ WHISPER_MODEL_CACHE: Any | None = None
 INGEST_RETRY_BUCKETS: dict[str, dict[str, Any]] = {}
 LATENCY_WARN_THRESHOLD_MS = 3000
 api_logger = logging.getLogger("accord.api")
+TRACEMALLOC_LAST_SNAPSHOT: tracemalloc.Snapshot | None = None
 
 # Keep UQC values constrained to GSTN-style codes; alias map handles common user inputs.
 ALLOWED_UQC = {
@@ -1864,6 +1885,53 @@ class StudioTemplateSaveIn(BaseModel):
     blocks: list[dict[str, Any]] = Field(min_length=1)
 
 
+class BankStatementRowIn(BaseModel):
+    date: str = Field(min_length=4, max_length=40)
+    amount: Decimal
+    reference: str = Field(default="", max_length=300)
+    narration: str = Field(default="", max_length=500)
+
+
+class BankReconciliationIn(BaseModel):
+    bank_rows: list[BankStatementRowIn] = Field(min_length=1, max_length=5000)
+    from_date: date | None = None
+    to_date: date | None = None
+    fuzzy_threshold: float = Field(default=0.84, ge=0.5, le=0.995)
+    amount_tolerance: Decimal = Field(default=Decimal("1.0000"), ge=Decimal("0"))
+    enable_ai: bool = True
+
+
+class ReraAllocationRequestIn(BaseModel):
+    booking_id: str = Field(min_length=1, max_length=64)
+    payment_reference: str = Field(min_length=1, max_length=80)
+    event_type: str = Field(default="PAYMENT", min_length=7, max_length=7)
+    receipt_amount: Decimal = Field(gt=0)
+    override_rera_ratio: Decimal | None = Field(default=None, gt=0, lt=1)
+    override_reason: str | None = Field(default=None, max_length=256)
+
+
+class ReraBookingCreateIn(BaseModel):
+    booking_id: str = Field(min_length=1, max_length=64)
+    project_id: str = Field(min_length=1, max_length=64)
+    customer_name: str | None = Field(default=None, max_length=160)
+    unit_code: str | None = Field(default=None, max_length=64)
+    status: str = Field(default="ACTIVE", min_length=3, max_length=16)
+
+
+class ReraBookingUpdateIn(BaseModel):
+    project_id: str | None = Field(default=None, min_length=1, max_length=64)
+    customer_name: str | None = Field(default=None, max_length=160)
+    unit_code: str | None = Field(default=None, max_length=64)
+    status: str | None = Field(default=None, min_length=3, max_length=16)
+
+
+class UserDeviceTokenUpsertIn(BaseModel):
+    device_token: str = Field(min_length=20, max_length=4096)
+    platform: str = Field(default="unknown", min_length=2, max_length=24)
+    app_version: str | None = Field(default=None, max_length=80)
+    user_id: int | None = Field(default=None, gt=0)
+
+
 app = FastAPI(title="Friday Insights Ledger API", version="1.0.0")
 
 telemetry_service = TelemetryService(api_logger=api_logger, latency_warn_threshold_ms=LATENCY_WARN_THRESHOLD_MS)
@@ -1889,11 +1957,16 @@ accounting_service: AccountingService | None = None
 ingest_service: IngestService | None = None
 compliance_service: ComplianceService | None = None
 inventory_service: InventoryService | None = None
+banking_service: BankingService | None = None
+report_service: ReportService | None = None
+variance_analyzer_service: AiVarianceAnalyzer | None = None
 statutory_service: StatutoryService | None = None
 gst_service: GstService | None = None
 currency_service: CurrencyService | None = None
 voice_service: VoiceService | None = None
 govt_bridge_service: GovtBridgeService | None = None
+rera_allocation_service: ReraAllocationService | None = None
+commission_service: CommissionService | None = None
 voucher_service = VoucherService()
 
 cors_allow_origins = resolve_cors_allow_origins()
@@ -1950,6 +2023,39 @@ def ensure_service_layer() -> tuple[AccountingService, IngestService, Compliance
     return accounting_service, ingest_service, compliance_service, inventory_service
 
 
+def ensure_banking_service() -> BankingService:
+    global banking_service
+    if banking_service is None:
+        banking_service = BankingService(
+            parse_amount_from_text=parse_amount_from_text,
+            money_str=money_str,
+            run_ollama_generate=run_ollama_generate,
+            recon_model=RECON_MODEL,
+        )
+    return banking_service
+
+
+def ensure_report_service() -> ReportService:
+    global report_service
+    if report_service is None:
+        report_service = ReportService(
+            money=money,
+            money_str=money_str,
+        )
+    return report_service
+
+
+def ensure_variance_analyzer_service() -> AiVarianceAnalyzer:
+    global variance_analyzer_service
+    if variance_analyzer_service is None:
+        variance_analyzer_service = AiVarianceAnalyzer(
+            get_conn=get_conn,
+            run_ollama_generate=run_ollama_generate,
+            model=VARIANCE_MODEL,
+        )
+    return variance_analyzer_service
+
+
 def ensure_statutory_service() -> StatutoryService:
     global statutory_service
     if statutory_service is None:
@@ -1993,6 +2099,125 @@ def ensure_govt_bridge_service() -> GovtBridgeService:
         govt_bridge_service = GovtBridgeService()
     return govt_bridge_service
 
+
+def ensure_rera_allocation_service() -> ReraAllocationService:
+    global rera_allocation_service
+    if rera_allocation_service is None:
+        rera_allocation_service = ReraAllocationService(
+            get_conn=get_conn,
+            high_value_alert_hook=dispatch_high_value_allocation_alert,
+        )
+    return rera_allocation_service
+
+
+def ensure_user_device_token_schema(conn: sqlite3.Connection) -> None:
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS user_device_tokens (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER NOT NULL,
+            device_token TEXT NOT NULL UNIQUE,
+            platform TEXT NOT NULL,
+            push_provider TEXT NOT NULL DEFAULT 'FCM',
+            app_version TEXT,
+            is_active INTEGER NOT NULL DEFAULT 1 CHECK(is_active IN (0, 1)),
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            last_seen_at TEXT NOT NULL
+        )
+        """
+    )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS push_notification_outbox (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            event_type TEXT NOT NULL,
+            user_id INTEGER NOT NULL,
+            device_token TEXT NOT NULL,
+            platform TEXT NOT NULL,
+            payload_json TEXT NOT NULL,
+            status TEXT NOT NULL DEFAULT 'PENDING' CHECK(status IN ('PENDING', 'SENT', 'FAILED')),
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        )
+        """
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_user_device_tokens_user ON user_device_tokens(user_id, is_active, updated_at DESC)"
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_push_outbox_status ON push_notification_outbox(status, created_at)"
+    )
+    conn.commit()
+
+
+def dispatch_high_value_allocation_alert(payload: dict[str, Any]) -> None:
+    now_iso = datetime.utcnow().isoformat(timespec="seconds") + "Z"
+    title = "High-Value Allocation Alert"
+    body = (
+        f"Booking {payload.get('booking_id')} posted allocation of INR {payload.get('receipt_amount')} "
+        f"(ref {payload.get('payment_reference')})."
+    )
+
+    with closing(get_conn()) as conn:
+        conn.row_factory = sqlite3.Row
+        ensure_user_device_token_schema(conn)
+
+        recipients = conn.execute(
+            """
+            SELECT user_id, device_token, platform
+            FROM user_device_tokens
+            WHERE is_active = 1
+            ORDER BY updated_at DESC
+            LIMIT 500
+            """
+        ).fetchall()
+
+        if not recipients:
+            return
+
+        for row in recipients:
+            outbox_payload = {
+                "title": title,
+                "body": body,
+                "channel": "HIGH_VALUE_ALLOCATION",
+                "allocation": payload,
+            }
+            conn.execute(
+                """
+                INSERT INTO push_notification_outbox(
+                    event_type, user_id, device_token, platform, payload_json, status, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, 'PENDING', ?, ?)
+                """,
+                (
+                    "HIGH_VALUE_ALLOCATION",
+                    int(row["user_id"]),
+                    str(row["device_token"]),
+                    str(row["platform"]),
+                    json.dumps(outbox_payload),
+                    now_iso,
+                    now_iso,
+                ),
+            )
+        conn.commit()
+
+    api_logger.info(
+        "queued high-value allocation push alerts",
+        extra={
+            "booking_id": str(payload.get("booking_id") or ""),
+            "payment_reference": str(payload.get("payment_reference") or ""),
+            "receipt_amount": str(payload.get("receipt_amount") or "0"),
+            "queued_recipients": len(recipients),
+        },
+    )
+
+
+def ensure_commission_service() -> CommissionService:
+    global commission_service
+    if commission_service is None:
+        commission_service = CommissionService(get_conn=get_conn)
+    return commission_service
+
 app.add_middleware(
     CORSMiddleware,
     allow_origins=cors_allow_origins,
@@ -2023,6 +2248,12 @@ async def request_telemetry_middleware(request: Request, call_next):
         request_id=request_id,
     )
     return response
+
+
+@app.middleware("http")
+async def rbac_middleware(request: Request, call_next):
+    enforce_rbac_policy(request)
+    return await call_next(request)
 
 
 @app.exception_handler(HTTPException)
@@ -2069,6 +2300,9 @@ def get_conn() -> sqlite3.Connection:
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA foreign_keys = ON;")
     return conn
+
+
+register_audit_logger_middleware(app, get_conn)
 
 
 SQLA_ENGINE = None
@@ -2451,9 +2685,20 @@ def init_db() -> None:
                 created_at TEXT NOT NULL
             );
 
+            CREATE TABLE IF NOT EXISTS audit_logs (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER NOT NULL DEFAULT 0,
+                action TEXT NOT NULL,
+                endpoint TEXT NOT NULL,
+                payload_snapshot TEXT NOT NULL,
+                timestamp TEXT NOT NULL
+            );
+
             CREATE INDEX IF NOT EXISTS idx_journal_lines_entry_id ON journal_lines(entry_id);
             CREATE INDEX IF NOT EXISTS idx_journal_lines_account_id ON journal_lines(account_id);
             CREATE INDEX IF NOT EXISTS idx_audit_edit_logs_table_record ON audit_edit_logs(table_name, record_id);
+            CREATE INDEX IF NOT EXISTS idx_audit_logs_endpoint_timestamp ON audit_logs(endpoint, timestamp DESC);
+            CREATE INDEX IF NOT EXISTS idx_audit_logs_user_timestamp ON audit_logs(user_id, timestamp DESC);
             CREATE INDEX IF NOT EXISTS idx_financial_periods_start_end ON financial_periods(start_date, end_date);
             CREATE INDEX IF NOT EXISTS idx_financial_periods_unlock_until ON financial_periods(unlocked_until);
             CREATE INDEX IF NOT EXISTS idx_tax_ledger_entry_id ON tax_ledger(entry_id);
@@ -2520,6 +2765,8 @@ def init_db() -> None:
         seed_hsn_master(conn)
         backfill_chain_of_trust(conn)
         ensure_studio_schema_sqlite(conn)
+        ensure_rera_allocation_service().ensure_schema(conn)
+        ensure_commission_service().ensure_schema(conn)
         conn.commit()
 
     if DB_BACKEND == "postgresql":
@@ -3694,6 +3941,16 @@ def require_admin_id(admin_id: str | None) -> int:
     if parsed <= 0:
         raise HTTPException(status_code=422, detail="X-Admin-Id must be a positive integer")
     return parsed
+
+
+app.include_router(create_booking_router(get_conn, require_role, require_admin_id))
+app.include_router(create_invoice_router(get_conn, require_role, require_admin_id))
+app.include_router(create_chat_router(get_conn, require_role, require_admin_id))
+app.include_router(create_vendor_router(get_conn))
+app.include_router(create_phase7_router(get_conn, require_role, require_admin_id))
+app.include_router(create_portal_router(get_conn))
+app.include_router(create_webhook_router(get_conn))
+app.include_router(support_router)
 
 
 def biometric_signature(admin_id: int, action: str, issued_at_unix: int) -> str:
@@ -4975,7 +5232,7 @@ def post_ca_alert_acknowledge(
     }
 
 
-@app.post("/api/v1/ca/playbooks/execute")
+@app.post("/api/v1/ca/playbooks/execute", dependencies=[Depends(rate_limit_heavy_task(seconds=10))])
 async def post_ca_playbooks_execute(
     payload: CAPlaybookExecuteIn,
     background_tasks: BackgroundTasks,
@@ -5337,6 +5594,9 @@ async def post_ca_verify_integrity(
 @app.on_event("startup")
 def startup() -> None:
     init_db()
+    if ENABLE_TRACEMALLOC and not tracemalloc.is_tracing():
+        tracemalloc.start(max(TRACEMALLOC_FRAMES, 5))
+        api_logger.info("tracemalloc enabled with %s frames", max(TRACEMALLOC_FRAMES, 5))
 
 
 @app.get("/api/v1/health")
@@ -5378,6 +5638,76 @@ def get_deployment_info() -> dict[str, Any]:
         "postgres_runtime_status": "PENDING_SQL_DIALECT_MIGRATION" if DB_BACKEND == "postgresql" else "NOT_REQUESTED",
         "cors_allow_origins": cors_allow_origins,
         "cors_allow_origin_regex": cors_allow_origin_regex,
+        "timestamp": datetime.utcnow().isoformat(timespec="seconds") + "Z",
+    }
+
+
+@app.get("/api/v1/system/memory-profile")
+def get_memory_profile(
+    limit: int = 20,
+    compare_with_previous: bool = False,
+    x_role: str | None = Header(default=None, alias="X-Role"),
+    x_admin_id: str | None = Header(default=None, alias="X-Admin-Id"),
+) -> dict[str, Any]:
+    require_role(x_role, {"admin"})
+    _ = require_admin_id(x_admin_id)
+
+    if not ENABLE_TRACEMALLOC:
+        raise HTTPException(
+            status_code=503,
+            detail="tracemalloc is disabled. Set ACCORD_ENABLE_TRACEMALLOC=1 and restart backend.",
+        )
+    if not tracemalloc.is_tracing():
+        tracemalloc.start(max(TRACEMALLOC_FRAMES, 5))
+
+    safe_limit = min(max(limit, 5), 100)
+    global TRACEMALLOC_LAST_SNAPSHOT
+    current = tracemalloc.take_snapshot()
+
+    if compare_with_previous and TRACEMALLOC_LAST_SNAPSHOT is not None:
+        stats = current.compare_to(TRACEMALLOC_LAST_SNAPSHOT, "lineno")
+        top_items = []
+        for idx, stat in enumerate(stats[:safe_limit], start=1):
+            frame = stat.traceback[0] if stat.traceback else None
+            top_items.append(
+                {
+                    "rank": idx,
+                    "file": frame.filename if frame else "unknown",
+                    "line": frame.lineno if frame else 0,
+                    "size_diff_bytes": int(stat.size_diff),
+                    "size_diff_kb": round(float(stat.size_diff) / 1024.0, 3),
+                    "count_diff": int(stat.count_diff),
+                }
+            )
+        mode = "diff"
+    else:
+        stats = current.statistics("lineno")
+        top_items = []
+        for idx, stat in enumerate(stats[:safe_limit], start=1):
+            frame = stat.traceback[0] if stat.traceback else None
+            top_items.append(
+                {
+                    "rank": idx,
+                    "file": frame.filename if frame else "unknown",
+                    "line": frame.lineno if frame else 0,
+                    "size_bytes": int(stat.size),
+                    "size_kb": round(float(stat.size) / 1024.0, 3),
+                    "count": int(stat.count),
+                }
+            )
+        mode = "absolute"
+
+    current_mem, peak_mem = tracemalloc.get_traced_memory()
+    TRACEMALLOC_LAST_SNAPSHOT = current
+
+    return {
+        "status": "ok",
+        "mode": mode,
+        "limit": safe_limit,
+        "trace_frames": max(TRACEMALLOC_FRAMES, 5),
+        "traced_memory_current_bytes": int(current_mem),
+        "traced_memory_peak_bytes": int(peak_mem),
+        "items": top_items,
         "timestamp": datetime.utcnow().isoformat(timespec="seconds") + "Z",
     }
 
@@ -5695,6 +6025,637 @@ def post_ledger_revalue(
         "revaluation_entry_id": reval_entry_id,
         "revaluation_reference": reval_reference,
         "impacted_entries": impacted[:200],
+    }
+
+
+RERA_BOOKING_ALLOWED_STATUS = {"ACTIVE", "CANCELLED", "CLOSED"}
+
+
+def normalize_rera_booking_status(status: str) -> str:
+    normalized = status.strip().upper()
+    if normalized not in RERA_BOOKING_ALLOWED_STATUS:
+        raise HTTPException(status_code=422, detail="status must be ACTIVE, CANCELLED, or CLOSED")
+    return normalized
+
+
+def serialize_rera_booking_row(row: sqlite3.Row) -> dict[str, Any]:
+    return {
+        "booking_id": row["booking_id"],
+        "project_id": row["project_id"],
+        "customer_name": row["customer_name"],
+        "unit_code": row["unit_code"],
+        "status": row["status"],
+        "created_at": row["created_at"],
+        "updated_at": row["updated_at"],
+    }
+
+
+def compute_rera_idempotency_request_hash(
+    *,
+    booking_id: str,
+    payment_reference: str,
+    event_type: str,
+    receipt_amount: Decimal,
+    override_rera_ratio: Decimal | None,
+    override_reason: str | None,
+) -> str:
+    receipt_amount_text = f"{Decimal(str(receipt_amount)).quantize(Decimal('0.01')):.2f}"
+    ratio_text = ""
+    if override_rera_ratio is not None:
+        ratio_text = f"{Decimal(str(override_rera_ratio)).quantize(Decimal('0.0001')):.4f}"
+    reason_text = (override_reason or "").strip()
+    basis = "|".join(
+        [
+            booking_id,
+            payment_reference,
+            event_type,
+            receipt_amount_text,
+            ratio_text,
+            reason_text,
+        ]
+    )
+    return sha256(basis.encode("utf-8")).hexdigest()
+
+
+def fetch_rera_allocation_event_row(conn: sqlite3.Connection, event_id: int) -> sqlite3.Row | None:
+    return conn.execute(
+        """
+        SELECT id, booking_id, payment_reference, event_type, receipt_amount,
+               applied_rera_ratio, rera_amount, operations_amount,
+               is_override, override_reason, actor_role, status, created_at
+        FROM rera_allocation_events
+        WHERE id = ?
+        """,
+        (event_id,),
+    ).fetchone()
+
+
+def build_rera_allocation_response(
+    *,
+    row: sqlite3.Row,
+    actor_role: str,
+    actor_admin_id: int,
+    idempotency_key: str | None,
+    idempotency_replayed: bool,
+) -> dict[str, Any]:
+    receipt_amount = Decimal(str(row["receipt_amount"]))
+    if str(row["event_type"]).upper() == "REFUND":
+        receipt_amount = receipt_amount * Decimal("-1")
+
+    payload: dict[str, Any] = {
+        "status": "ok",
+        "event_id": int(row["id"]),
+        "booking_id": row["booking_id"],
+        "payment_reference": row["payment_reference"],
+        "event_type": row["event_type"],
+        "allocation": {
+            "receipt_amount": f"{receipt_amount:.2f}",
+            "applied_rera_ratio": row["applied_rera_ratio"],
+            "rera_amount": row["rera_amount"],
+            "operations_amount": row["operations_amount"],
+            "is_override": bool(row["is_override"]),
+        },
+        "audit": {
+            "override_reason": row["override_reason"],
+            "actor_role": actor_role,
+            "actor_admin_id": actor_admin_id,
+            "created_at": row["created_at"],
+        },
+    }
+    if idempotency_key:
+        payload["idempotency"] = {
+            "key": idempotency_key,
+            "replayed": idempotency_replayed,
+        }
+    return payload
+
+
+@app.post("/api/v1/rera/bookings")
+def post_rera_booking(
+    payload: ReraBookingCreateIn,
+    x_role: str | None = Header(default=None, alias="X-Role"),
+    x_admin_id: str | None = Header(default=None, alias="X-Admin-Id"),
+) -> dict[str, Any]:
+    require_role(x_role, {"admin", "ca"})
+    require_admin_id(x_admin_id)
+
+    now_iso = datetime.utcnow().isoformat(timespec="seconds") + "Z"
+    booking_id = payload.booking_id.strip()
+    project_id = payload.project_id.strip()
+    status = normalize_rera_booking_status(payload.status)
+    customer_name = (payload.customer_name or "").strip() or None
+    unit_code = (payload.unit_code or "").strip() or None
+
+    service = ensure_rera_allocation_service()
+    with closing(get_conn()) as conn:
+        service.ensure_schema(conn)
+        try:
+            conn.execute(
+                """
+                INSERT INTO sales_bookings(booking_id, project_id, customer_name, unit_code, status, created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                (booking_id, project_id, customer_name, unit_code, status, now_iso, now_iso),
+            )
+            conn.commit()
+        except sqlite3.IntegrityError as exc:
+            raise HTTPException(status_code=409, detail="booking_id already exists") from exc
+
+        row = conn.execute(
+            """
+            SELECT booking_id, project_id, customer_name, unit_code, status, created_at, updated_at
+            FROM sales_bookings
+            WHERE booking_id = ?
+            """,
+            (booking_id,),
+        ).fetchone()
+
+    if row is None:
+        raise HTTPException(status_code=500, detail="booking created but not found")
+
+    return {
+        "status": "ok",
+        "booking": serialize_rera_booking_row(row),
+    }
+
+
+@app.get("/api/v1/rera/bookings")
+def get_rera_bookings(
+    status: str | None = None,
+    limit: int = 100,
+    x_role: str | None = Header(default=None, alias="X-Role"),
+    x_admin_id: str | None = Header(default=None, alias="X-Admin-Id"),
+) -> dict[str, Any]:
+    require_role(x_role, {"admin", "ca"})
+    require_admin_id(x_admin_id)
+
+    if limit < 1 or limit > 500:
+        raise HTTPException(status_code=422, detail="limit must be between 1 and 500")
+
+    status_filter = None
+    if status is not None and status.strip() != "":
+        status_filter = normalize_rera_booking_status(status)
+
+    service = ensure_rera_allocation_service()
+    with closing(get_conn()) as conn:
+        service.ensure_schema(conn)
+        if status_filter is None:
+            rows = conn.execute(
+                """
+                SELECT booking_id, project_id, customer_name, unit_code, status, created_at, updated_at
+                FROM sales_bookings
+                ORDER BY created_at DESC
+                LIMIT ?
+                """,
+                (limit,),
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                """
+                SELECT booking_id, project_id, customer_name, unit_code, status, created_at, updated_at
+                FROM sales_bookings
+                WHERE status = ?
+                ORDER BY created_at DESC
+                LIMIT ?
+                """,
+                (status_filter, limit),
+            ).fetchall()
+
+    return {
+        "status": "ok",
+        "count": len(rows),
+        "limit": limit,
+        "status_filter": status_filter,
+        "items": [serialize_rera_booking_row(row) for row in rows],
+    }
+
+
+@app.get("/api/v1/rera/bookings/{booking_id}")
+def get_rera_booking_by_id(
+    booking_id: str,
+    x_role: str | None = Header(default=None, alias="X-Role"),
+    x_admin_id: str | None = Header(default=None, alias="X-Admin-Id"),
+) -> dict[str, Any]:
+    require_role(x_role, {"admin", "ca"})
+    require_admin_id(x_admin_id)
+
+    booking_key = booking_id.strip()
+    service = ensure_rera_allocation_service()
+    with closing(get_conn()) as conn:
+        service.ensure_schema(conn)
+        row = conn.execute(
+            """
+            SELECT booking_id, project_id, customer_name, unit_code, status, created_at, updated_at
+            FROM sales_bookings
+            WHERE booking_id = ?
+            """,
+            (booking_key,),
+        ).fetchone()
+
+    if row is None:
+        raise HTTPException(status_code=404, detail="booking_id not found")
+
+    return {
+        "status": "ok",
+        "booking": serialize_rera_booking_row(row),
+    }
+
+
+@app.put("/api/v1/rera/bookings/{booking_id}")
+def put_rera_booking(
+    booking_id: str,
+    payload: ReraBookingUpdateIn,
+    x_role: str | None = Header(default=None, alias="X-Role"),
+    x_admin_id: str | None = Header(default=None, alias="X-Admin-Id"),
+) -> dict[str, Any]:
+    require_role(x_role, {"admin", "ca"})
+    require_admin_id(x_admin_id)
+
+    updates: dict[str, Any] = {}
+    if payload.project_id is not None:
+        updates["project_id"] = payload.project_id.strip()
+    if payload.customer_name is not None:
+        updates["customer_name"] = payload.customer_name.strip() or None
+    if payload.unit_code is not None:
+        updates["unit_code"] = payload.unit_code.strip() or None
+    if payload.status is not None:
+        updates["status"] = normalize_rera_booking_status(payload.status)
+
+    if not updates:
+        raise HTTPException(status_code=422, detail="at least one field must be provided for update")
+
+    updates["updated_at"] = datetime.utcnow().isoformat(timespec="seconds") + "Z"
+    booking_key = booking_id.strip()
+
+    service = ensure_rera_allocation_service()
+    with closing(get_conn()) as conn:
+        service.ensure_schema(conn)
+        current = conn.execute(
+            "SELECT booking_id FROM sales_bookings WHERE booking_id = ?",
+            (booking_key,),
+        ).fetchone()
+        if current is None:
+            raise HTTPException(status_code=404, detail="booking_id not found")
+
+        set_clause = ", ".join(f"{col} = ?" for col in updates.keys())
+        values = list(updates.values()) + [booking_key]
+        conn.execute(f"UPDATE sales_bookings SET {set_clause} WHERE booking_id = ?", values)
+        conn.commit()
+
+        row = conn.execute(
+            """
+            SELECT booking_id, project_id, customer_name, unit_code, status, created_at, updated_at
+            FROM sales_bookings
+            WHERE booking_id = ?
+            """,
+            (booking_key,),
+        ).fetchone()
+
+    if row is None:
+        raise HTTPException(status_code=500, detail="booking updated but not found")
+
+    return {
+        "status": "ok",
+        "booking": serialize_rera_booking_row(row),
+    }
+
+
+@app.delete("/api/v1/rera/bookings/{booking_id}")
+def delete_rera_booking(
+    booking_id: str,
+    x_role: str | None = Header(default=None, alias="X-Role"),
+    x_admin_id: str | None = Header(default=None, alias="X-Admin-Id"),
+) -> dict[str, Any]:
+    require_role(x_role, {"admin", "ca"})
+    require_admin_id(x_admin_id)
+
+    booking_key = booking_id.strip()
+    service = ensure_rera_allocation_service()
+    with closing(get_conn()) as conn:
+        service.ensure_schema(conn)
+        row = conn.execute(
+            "SELECT booking_id FROM sales_bookings WHERE booking_id = ?",
+            (booking_key,),
+        ).fetchone()
+        if row is None:
+            raise HTTPException(status_code=404, detail="booking_id not found")
+
+        try:
+            conn.execute("DELETE FROM sales_bookings WHERE booking_id = ?", (booking_key,))
+            conn.commit()
+        except sqlite3.IntegrityError as exc:
+            raise HTTPException(
+                status_code=409,
+                detail="booking has linked allocation events and cannot be deleted",
+            ) from exc
+
+    return {
+        "status": "ok",
+        "booking_id": booking_key,
+        "deleted": True,
+    }
+
+
+@app.post("/api/v1/users/device-token")
+def post_user_device_token(
+    payload: UserDeviceTokenUpsertIn,
+    x_role: str | None = Header(default=None, alias="X-Role"),
+    x_admin_id: str | None = Header(default=None, alias="X-Admin-Id"),
+) -> dict[str, Any]:
+    require_role(x_role, {"admin", "ca", "ops"})
+    admin_id = require_admin_id(x_admin_id)
+
+    now_iso = datetime.utcnow().isoformat(timespec="seconds") + "Z"
+    normalized_platform = payload.platform.strip().lower() or "unknown"
+    effective_user_id = int(payload.user_id or admin_id)
+    token_value = payload.device_token.strip()
+
+    with closing(get_conn()) as conn:
+        conn.row_factory = sqlite3.Row
+        ensure_user_device_token_schema(conn)
+
+        existing = conn.execute(
+            "SELECT id FROM user_device_tokens WHERE device_token = ?",
+            (token_value,),
+        ).fetchone()
+
+        if existing is None:
+            cursor = conn.execute(
+                """
+                INSERT INTO user_device_tokens(
+                    user_id, device_token, platform, push_provider, app_version,
+                    is_active, created_at, updated_at, last_seen_at
+                ) VALUES (?, ?, ?, 'FCM', ?, 1, ?, ?, ?)
+                """,
+                (
+                    effective_user_id,
+                    token_value,
+                    normalized_platform,
+                    (payload.app_version or "").strip() or None,
+                    now_iso,
+                    now_iso,
+                    now_iso,
+                ),
+            )
+            token_id = int(cursor.lastrowid)
+            was_created = True
+        else:
+            token_id = int(existing["id"])
+            conn.execute(
+                """
+                UPDATE user_device_tokens
+                SET user_id = ?,
+                    platform = ?,
+                    push_provider = 'FCM',
+                    app_version = ?,
+                    is_active = 1,
+                    updated_at = ?,
+                    last_seen_at = ?
+                WHERE id = ?
+                """,
+                (
+                    effective_user_id,
+                    normalized_platform,
+                    (payload.app_version or "").strip() or None,
+                    now_iso,
+                    now_iso,
+                    token_id,
+                ),
+            )
+            was_created = False
+
+        conn.commit()
+
+    return {
+        "status": "ok",
+        "token_id": token_id,
+        "user_id": effective_user_id,
+        "platform": normalized_platform,
+        "provider": "FCM",
+        "created": was_created,
+    }
+
+
+@app.post("/api/v1/rera/allocations")
+def post_rera_allocation(
+    payload: ReraAllocationRequestIn,
+    request: Request,
+    x_role: str | None = Header(default=None, alias="X-Role"),
+    x_admin_id: str | None = Header(default=None, alias="X-Admin-Id"),
+    x_idempotency_key: str | None = Header(default=None, alias="X-Idempotency-Key"),
+) -> dict[str, Any]:
+    role = require_role(x_role, {"admin", "ca"})
+    admin_id = require_admin_id(x_admin_id)
+
+    service = ensure_rera_allocation_service()
+    booking_id = payload.booking_id.strip()
+    payment_reference = payload.payment_reference.strip()
+    event_type = payload.event_type.strip().upper()
+
+    if event_type not in {"PAYMENT", "REFUND"}:
+        raise HTTPException(status_code=422, detail="event_type must be PAYMENT or REFUND")
+
+    idempotency_key = (x_idempotency_key or request.headers.get("Idempotency-Key") or "").strip() or None
+    if idempotency_key is not None and (len(idempotency_key) < 8 or len(idempotency_key) > 120):
+        raise HTTPException(status_code=422, detail="idempotency key length must be between 8 and 120")
+
+    request_hash = compute_rera_idempotency_request_hash(
+        booking_id=booking_id,
+        payment_reference=payment_reference,
+        event_type=event_type,
+        receipt_amount=payload.receipt_amount,
+        override_rera_ratio=payload.override_rera_ratio,
+        override_reason=payload.override_reason,
+    )
+
+    idempotency_reserved = False
+    if idempotency_key:
+        now_iso = datetime.utcnow().isoformat(timespec="seconds") + "Z"
+        with closing(get_conn()) as conn:
+            service.ensure_schema(conn)
+            existing = conn.execute(
+                """
+                SELECT request_hash, allocation_event_id
+                FROM rera_allocation_idempotency
+                WHERE idempotency_key = ?
+                """,
+                (idempotency_key,),
+            ).fetchone()
+
+            if existing is not None:
+                if str(existing["request_hash"]) != request_hash:
+                    raise HTTPException(
+                        status_code=409,
+                        detail="idempotency key already used with a different request payload",
+                    )
+                existing_event_id = existing["allocation_event_id"]
+                if existing_event_id is None:
+                    raise HTTPException(status_code=409, detail="idempotent request is currently being processed")
+                event_row = fetch_rera_allocation_event_row(conn, int(existing_event_id))
+                if event_row is None:
+                    raise HTTPException(status_code=409, detail="idempotency record exists but event is missing")
+                return build_rera_allocation_response(
+                    row=event_row,
+                    actor_role=role.upper(),
+                    actor_admin_id=admin_id,
+                    idempotency_key=idempotency_key,
+                    idempotency_replayed=True,
+                )
+
+            conn.execute(
+                """
+                INSERT INTO rera_allocation_idempotency(
+                    idempotency_key, request_hash, allocation_event_id, created_at, updated_at
+                ) VALUES (?, ?, NULL, ?, ?)
+                """,
+                (idempotency_key, request_hash, now_iso, now_iso),
+            )
+            conn.commit()
+            idempotency_reserved = True
+
+    try:
+        result = service.allocate(
+            AllocationInput(
+                booking_id=booking_id,
+                payment_reference=payment_reference,
+                event_type=event_type,
+                receipt_amount=payload.receipt_amount,
+                override_rera_ratio=payload.override_rera_ratio,
+                override_reason=(payload.override_reason or "").strip() or None,
+                actor_role=role.upper(),
+            )
+        )
+    except ValueError as exc:
+        if idempotency_key and idempotency_reserved:
+            with closing(get_conn()) as conn:
+                service.ensure_schema(conn)
+                conn.execute(
+                    """
+                    DELETE FROM rera_allocation_idempotency
+                    WHERE idempotency_key = ? AND request_hash = ? AND allocation_event_id IS NULL
+                    """,
+                    (idempotency_key, request_hash),
+                )
+                conn.commit()
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    except sqlite3.IntegrityError as exc:
+        if idempotency_key and idempotency_reserved:
+            with closing(get_conn()) as conn:
+                service.ensure_schema(conn)
+                conn.execute(
+                    """
+                    DELETE FROM rera_allocation_idempotency
+                    WHERE idempotency_key = ? AND request_hash = ? AND allocation_event_id IS NULL
+                    """,
+                    (idempotency_key, request_hash),
+                )
+                conn.commit()
+        err = str(exc).lower()
+        if "foreign key" in err:
+            raise HTTPException(status_code=404, detail="booking_id not found in sales_bookings") from exc
+        if "unique" in err:
+            raise HTTPException(
+                status_code=409,
+                detail="allocation already exists for booking_id + payment_reference + event_type",
+            ) from exc
+        raise HTTPException(status_code=400, detail=f"allocation failed: {exc}") from exc
+
+    with closing(get_conn()) as conn:
+        service.ensure_schema(conn)
+        row = fetch_rera_allocation_event_row(conn, int(result.event_id))
+        if idempotency_key:
+            now_iso = datetime.utcnow().isoformat(timespec="seconds") + "Z"
+            conn.execute(
+                """
+                UPDATE rera_allocation_idempotency
+                SET allocation_event_id = ?, updated_at = ?
+                WHERE idempotency_key = ? AND request_hash = ?
+                """,
+                (int(result.event_id), now_iso, idempotency_key, request_hash),
+            )
+            conn.commit()
+
+    if row is None:
+        raise HTTPException(status_code=500, detail="allocation created but event row not found")
+
+    released_commissions = ensure_commission_service().release_commissions_for_booking(booking_id)
+
+    response = build_rera_allocation_response(
+        row=row,
+        actor_role=role.upper(),
+        actor_admin_id=admin_id,
+        idempotency_key=idempotency_key,
+        idempotency_replayed=False,
+    )
+    response["broker_commissions_released"] = released_commissions
+    return response
+
+
+@app.get("/api/v1/rera/allocations")
+def get_rera_allocations(
+    booking_id: str | None = None,
+    limit: int = 100,
+    x_role: str | None = Header(default=None, alias="X-Role"),
+    x_admin_id: str | None = Header(default=None, alias="X-Admin-Id"),
+) -> dict[str, Any]:
+    require_role(x_role, {"admin", "ca"})
+    require_admin_id(x_admin_id)
+
+    if limit < 1 or limit > 500:
+        raise HTTPException(status_code=422, detail="limit must be between 1 and 500")
+
+    service = ensure_rera_allocation_service()
+    with closing(get_conn()) as conn:
+        service.ensure_schema(conn)
+        if booking_id is not None and booking_id.strip() != "":
+            rows = conn.execute(
+                """
+                SELECT id, booking_id, payment_reference, event_type, receipt_amount,
+                       applied_rera_ratio, rera_amount, operations_amount,
+                       is_override, override_reason, actor_role, status, created_at
+                FROM rera_allocation_events
+                WHERE booking_id = ?
+                ORDER BY id DESC
+                LIMIT ?
+                """,
+                (booking_id.strip(), limit),
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                """
+                SELECT id, booking_id, payment_reference, event_type, receipt_amount,
+                       applied_rera_ratio, rera_amount, operations_amount,
+                       is_override, override_reason, actor_role, status, created_at
+                FROM rera_allocation_events
+                ORDER BY id DESC
+                LIMIT ?
+                """,
+                (limit,),
+            ).fetchall()
+
+    return {
+        "status": "ok",
+        "count": len(rows),
+        "limit": limit,
+        "booking_id_filter": booking_id.strip() if booking_id is not None else None,
+        "items": [
+            {
+                "event_id": int(row["id"]),
+                "booking_id": row["booking_id"],
+                "payment_reference": row["payment_reference"],
+                "event_type": row["event_type"],
+                "receipt_amount": row["receipt_amount"],
+                "applied_rera_ratio": row["applied_rera_ratio"],
+                "rera_amount": row["rera_amount"],
+                "operations_amount": row["operations_amount"],
+                "is_override": bool(row["is_override"]),
+                "override_reason": row["override_reason"],
+                "actor_role": row["actor_role"],
+                "status": row["status"],
+                "created_at": row["created_at"],
+            }
+            for row in rows
+        ],
     }
 
 
@@ -6839,6 +7800,211 @@ async def post_nudge_vendor(
         "whatsapp_message": nudge["message"],
         "twilio_status": twilio_status,
     }
+
+
+def _fetch_ledger_rows_for_bank_reconciliation(
+    *,
+    from_date: date | None,
+    to_date: date | None,
+) -> list[dict[str, Any]]:
+    query = (
+        """
+        SELECT je.id,
+               je.date,
+               je.reference,
+               je.description,
+               MAX(CASE WHEN CAST(jl.debit AS REAL) > 0 THEN jl.debit ELSE jl.credit END) AS amount
+        FROM journal_entries je
+        JOIN journal_lines jl ON jl.entry_id = je.id
+        WHERE je.status = 'POSTED'
+        """
+    )
+    params: list[Any] = []
+    if from_date is not None:
+        query += " AND je.date >= ?"
+        params.append(from_date.isoformat())
+    if to_date is not None:
+        query += " AND je.date <= ?"
+        params.append(to_date.isoformat())
+
+    query += " GROUP BY je.id, je.date, je.reference, je.description ORDER BY je.date DESC, je.id DESC"
+
+    with closing(get_conn()) as conn:
+        rows = conn.execute(query, tuple(params)).fetchall()
+        return [dict(row) for row in rows]
+
+
+def _parse_bank_statement_csv(raw: bytes) -> list[dict[str, Any]]:
+    try:
+        text_blob = raw.decode("utf-8")
+    except UnicodeDecodeError:
+        text_blob = raw.decode("latin-1")
+
+    reader = csv.DictReader(io.StringIO(text_blob))
+    parsed: list[dict[str, Any]] = []
+    for row in reader:
+        if not row:
+            continue
+        date_value = str(
+            row.get("date")
+            or row.get("txn_date")
+            or row.get("transaction_date")
+            or row.get("value_date")
+            or ""
+        ).strip()
+        amount_value = str(
+            row.get("amount")
+            or row.get("txn_amount")
+            or row.get("debit")
+            or row.get("credit")
+            or "0"
+        ).strip()
+        reference = str(
+            row.get("reference")
+            or row.get("narration")
+            or row.get("description")
+            or row.get("remarks")
+            or ""
+        ).strip()
+
+        amount = parse_amount_from_text(amount_value)
+        if amount <= 0:
+            continue
+
+        parsed.append(
+            {
+                "date": date_value,
+                "amount": money_str(amount),
+                "reference": reference,
+                "narration": reference,
+            }
+        )
+
+    return parsed
+
+
+@app.post("/api/v1/ledger/reconcile-bank")
+async def reconcile_bank_statement(
+    payload: BankReconciliationIn,
+    x_role: str | None = Header(default=None, alias="X-Role"),
+    x_admin_id: str | None = Header(default=None, alias="X-Admin-Id"),
+) -> dict[str, Any]:
+    role = require_role(x_role, {"admin", "ca"})
+    admin_id = require_admin_id(x_admin_id)
+    banking_layer = ensure_banking_service()
+
+    ledger_rows = _fetch_ledger_rows_for_bank_reconciliation(
+        from_date=payload.from_date,
+        to_date=payload.to_date,
+    )
+    if not ledger_rows:
+        raise HTTPException(status_code=422, detail="No posted ledger entries found for requested window")
+
+    bank_rows = [
+        {
+            "date": row.date,
+            "amount": money_str(row.amount),
+            "reference": row.reference,
+            "narration": row.narration,
+        }
+        for row in payload.bank_rows
+    ]
+
+    reconciliation = await banking_layer.reconcile_statement_multi_pass(
+        bank_rows=bank_rows,
+        ledger_rows=ledger_rows,
+        fuzzy_threshold=payload.fuzzy_threshold,
+        amount_tolerance=money_str(payload.amount_tolerance),
+        enable_ai=payload.enable_ai,
+    )
+
+    with closing(get_conn()) as conn:
+        conn.execute("BEGIN")
+        log_audit(
+            conn,
+            table_name="reports",
+            record_id=0,
+            action="BANK_STATEMENT_RECONCILIATION",
+            old_value=None,
+            new_value={
+                "engine": reconciliation.get("engine"),
+                "bank_rows": len(bank_rows),
+                "ledger_rows": len(ledger_rows),
+                "matched": reconciliation.get("summary", {}).get("matched_count", 0),
+                "match_rate_pct": reconciliation.get("match_rate_pct"),
+                "actor_role": role,
+            },
+            user_id=admin_id,
+            high_priority=True,
+        )
+        conn.commit()
+
+    return reconciliation
+
+
+@app.post("/api/v1/ledger/reconcile-bank/csv")
+async def reconcile_bank_statement_csv(
+    file: UploadFile = File(...),
+    from_date: date | None = None,
+    to_date: date | None = None,
+    fuzzy_threshold: float = 0.84,
+    amount_tolerance: str = "1.0000",
+    enable_ai: bool = True,
+    x_role: str | None = Header(default=None, alias="X-Role"),
+    x_admin_id: str | None = Header(default=None, alias="X-Admin-Id"),
+) -> dict[str, Any]:
+    role = require_role(x_role, {"admin", "ca"})
+    admin_id = require_admin_id(x_admin_id)
+    banking_layer = ensure_banking_service()
+
+    if not file.filename:
+        raise HTTPException(status_code=400, detail="Missing bank statement file name")
+    if not file.filename.lower().endswith(".csv"):
+        raise HTTPException(status_code=422, detail="Only CSV statements are currently supported")
+
+    raw = await file.read()
+    if not raw:
+        raise HTTPException(status_code=400, detail="Uploaded statement file is empty")
+
+    bank_rows = _parse_bank_statement_csv(raw)
+    if not bank_rows:
+        raise HTTPException(status_code=422, detail="No valid statement rows found in CSV")
+
+    ledger_rows = _fetch_ledger_rows_for_bank_reconciliation(from_date=from_date, to_date=to_date)
+    if not ledger_rows:
+        raise HTTPException(status_code=422, detail="No posted ledger entries found for requested window")
+
+    reconciliation = await banking_layer.reconcile_statement_multi_pass(
+        bank_rows=bank_rows,
+        ledger_rows=ledger_rows,
+        fuzzy_threshold=fuzzy_threshold,
+        amount_tolerance=amount_tolerance,
+        enable_ai=enable_ai,
+    )
+
+    with closing(get_conn()) as conn:
+        conn.execute("BEGIN")
+        log_audit(
+            conn,
+            table_name="reports",
+            record_id=0,
+            action="BANK_STATEMENT_RECONCILIATION_CSV",
+            old_value=None,
+            new_value={
+                "engine": reconciliation.get("engine"),
+                "file_name": file.filename,
+                "bank_rows": len(bank_rows),
+                "ledger_rows": len(ledger_rows),
+                "matched": reconciliation.get("summary", {}).get("matched_count", 0),
+                "match_rate_pct": reconciliation.get("match_rate_pct"),
+                "actor_role": role,
+            },
+            user_id=admin_id,
+            high_priority=True,
+        )
+        conn.commit()
+
+    return reconciliation
 
 
 @app.post("/api/v1/ledger/reconcile-2b")
@@ -8139,6 +9305,218 @@ def get_journal_audit_trail(entry_id: int) -> dict[str, Any]:
     }
 
 
+def _resolve_month_window(month: str | None) -> tuple[date, date, str]:
+    if month:
+        try:
+            base = datetime.strptime(month, "%Y-%m").date().replace(day=1)
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail="month must be in YYYY-MM format") from exc
+    else:
+        base = date.today().replace(day=1)
+
+    if base.month == 12:
+        next_month = date(base.year + 1, 1, 1)
+    else:
+        next_month = date(base.year, base.month + 1, 1)
+    period_end = next_month - timedelta(days=1)
+    return base, period_end, base.strftime("%b %Y")
+
+
+def _fetch_monthly_ledger_entries(*, period_start: date, period_end: date) -> list[dict[str, Any]]:
+    with closing(get_conn()) as conn:
+        rows = conn.execute(
+            """
+            SELECT je.id,
+                   je.date,
+                   je.reference,
+                   je.description,
+                   COALESCE(SUM(CAST(jl.debit AS REAL)), 0) AS total_debit,
+                   COALESCE(SUM(CAST(jl.credit AS REAL)), 0) AS total_credit
+            FROM journal_entries je
+            JOIN journal_lines jl ON jl.entry_id = je.id
+            WHERE je.status = 'POSTED'
+              AND je.date >= ?
+              AND je.date <= ?
+            GROUP BY je.id, je.date, je.reference, je.description
+            ORDER BY je.date ASC, je.id ASC
+            """,
+            (period_start.isoformat(), period_end.isoformat()),
+        ).fetchall()
+
+    return [
+        {
+            "id": int(row["id"]),
+            "date": str(row["date"]),
+            "reference": str(row["reference"] or ""),
+            "description": str(row["description"] or ""),
+            "total_debit": money_str(row["total_debit"]),
+            "total_credit": money_str(row["total_credit"]),
+        }
+        for row in rows
+    ]
+
+
+def _fetch_latest_market_context() -> dict[str, Any]:
+    with closing(get_conn()) as conn:
+        latest_market = conn.execute(
+            """
+            SELECT source_kind, analysis_json, created_at
+            FROM market_trend_reports
+            ORDER BY created_at DESC, id DESC
+            LIMIT 1
+            """
+        ).fetchone()
+
+    if latest_market is None:
+        return {
+            "risk_level": "MEDIUM",
+            "source_kind": "NONE",
+            "created_at": "",
+            "trend_summary": "No market trend reports available",
+        }
+
+    parsed_market: dict[str, Any] = {}
+    try:
+        parsed = json.loads(str(latest_market["analysis_json"] or "{}"))
+        parsed_market = parsed if isinstance(parsed, dict) else {}
+    except Exception:  # noqa: BLE001
+        parsed_market = {}
+
+    return {
+        "risk_level": str(parsed_market.get("risk_level") or "MEDIUM").upper(),
+        "source_kind": str(latest_market["source_kind"] or "UNKNOWN"),
+        "created_at": str(latest_market["created_at"] or ""),
+        "trend_summary": str(parsed_market.get("trend_summary") or "Market trend summary unavailable"),
+    }
+
+
+@app.get("/api/v1/reports/ca/monthly")
+def get_ca_monthly_report(
+    month: str | None = None,
+    limit: int = 300,
+    x_role: str | None = Header(default=None, alias="X-Role"),
+    x_admin_id: str | None = Header(default=None, alias="X-Admin-Id"),
+) -> dict[str, Any]:
+    require_role(x_role, {"admin", "ca"})
+    admin_id = require_admin_id(x_admin_id)
+    safe_limit = min(max(limit, 10), 2000)
+
+    period_start, period_end, period_label = _resolve_month_window(month)
+    entries = _fetch_monthly_ledger_entries(period_start=period_start, period_end=period_end)[:safe_limit]
+    heatmap = get_ca_heatmap(limit=100, x_role=x_role, x_admin_id=x_admin_id)
+    friday_summary = get_friday_summary(as_of_date=period_end)
+    market_context = _fetch_latest_market_context()
+
+    report_layer = ensure_report_service()
+    payload = report_layer.build_ca_monthly_payload(
+        period_start=period_start,
+        period_end=period_end,
+        ledger_entries=entries,
+        heatmap=heatmap,
+        friday_summary=friday_summary,
+        market_context=market_context,
+    )
+    payload["report_title"] = f"Accord Monthly Risk & Compliance Report - {period_label}"
+
+    with closing(get_conn()) as conn:
+        conn.execute("BEGIN")
+        log_audit(
+            conn,
+            table_name="reports",
+            record_id=0,
+            action="CA_MONTHLY_REPORT_GENERATED",
+            old_value=None,
+            new_value={
+                "month": month or period_start.strftime("%Y-%m"),
+                "period_from": period_start.isoformat(),
+                "period_to": period_end.isoformat(),
+                "entries_count": len(entries),
+                "generated_by": admin_id,
+            },
+            user_id=admin_id,
+            high_priority=True,
+        )
+        conn.commit()
+
+    return payload
+
+
+@app.get("/api/v1/reports/variance-analysis")
+async def get_variance_analysis(
+    spv_id: str | None = None,
+    x_role: str | None = Header(default=None, alias="X-Role"),
+    x_admin_id: str | None = Header(default=None, alias="X-Admin-Id"),
+) -> dict[str, Any]:
+    require_role(x_role, {"admin", "ca"})
+    admin_id = require_admin_id(x_admin_id)
+
+    analyzer = ensure_variance_analyzer_service()
+    payload = analyzer.get_budget_vs_actual(spv_id=(spv_id or "SPV-DEFAULT"))
+    markdown = await analyzer.generate_cfo_markdown(payload=payload)
+
+    with closing(get_conn()) as conn:
+        conn.execute("BEGIN")
+        log_audit(
+            conn,
+            table_name="reports",
+            record_id=0,
+            action="SPV_VARIANCE_ANALYSIS_GENERATED",
+            old_value=None,
+            new_value={
+                "spv_id": payload.get("spv_id", "SPV-DEFAULT"),
+                "period": payload.get("period", {}),
+                "top_overruns": payload.get("top_overruns", []),
+                "generated_by": admin_id,
+            },
+            user_id=admin_id,
+            high_priority=False,
+        )
+        conn.commit()
+
+    return {
+        "status": "ok",
+        "spv_id": payload.get("spv_id", "SPV-DEFAULT"),
+        "period": payload.get("period", {}),
+        "budget_vs_actual": payload.get("items", []),
+        "analysis_markdown": markdown,
+        "model": VARIANCE_MODEL,
+    }
+
+
+@app.get("/api/v1/reports/ca/monthly/pdf")
+def get_ca_monthly_report_pdf(
+    month: str | None = None,
+    x_role: str | None = Header(default=None, alias="X-Role"),
+    x_admin_id: str | None = Header(default=None, alias="X-Admin-Id"),
+) -> Response:
+    payload = get_ca_monthly_report(month=month, x_role=x_role, x_admin_id=x_admin_id)
+    report_layer = ensure_report_service()
+    content = report_layer.generate_ca_monthly_pdf(payload)
+    filename = f"Accord_CA_Monthly_Report_{(month or date.today().strftime('%Y-%m'))}.pdf"
+    return Response(
+        content=content,
+        media_type="application/pdf",
+        headers={"Content-Disposition": f"attachment; filename={filename}"},
+    )
+
+
+@app.get("/api/v1/reports/ca/monthly/excel")
+def get_ca_monthly_report_excel(
+    month: str | None = None,
+    x_role: str | None = Header(default=None, alias="X-Role"),
+    x_admin_id: str | None = Header(default=None, alias="X-Admin-Id"),
+) -> Response:
+    payload = get_ca_monthly_report(month=month, x_role=x_role, x_admin_id=x_admin_id)
+    report_layer = ensure_report_service()
+    content = report_layer.generate_ca_monthly_excel(payload)
+    filename = f"Accord_CA_Monthly_Report_{(month or date.today().strftime('%Y-%m'))}.xlsx"
+    return Response(
+        content=content,
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        headers={"Content-Disposition": f"attachment; filename={filename}"},
+    )
+
+
 @app.get("/api/v1/reports/gstr1-preview")
 def get_gstr1_preview(from_date: date | None = None, to_date: date | None = None) -> dict[str, Any]:
     report_from = from_date or date.today().replace(day=1)
@@ -8482,7 +9860,7 @@ def get_marketing_signups_report(limit: int = 200) -> dict[str, Any]:
     }
 
 
-@app.post("/api/v1/market-intel/upload")
+@app.post("/api/v1/market-intel/upload", dependencies=[Depends(rate_limit_heavy_task(seconds=10))])
 async def post_market_intel_upload(
     file: UploadFile = File(...),
     source_kind: str = "ACCOUNTING_MARKET_FEED",
@@ -9207,7 +10585,11 @@ async def post_ask_friday(payload: AskFridayIn) -> dict[str, Any]:
     }
 
 
-@app.api_route("/api/v1/insights/forensic-audit", methods=["GET", "POST"])
+@app.api_route(
+    "/api/v1/insights/forensic-audit",
+    methods=["GET", "POST"],
+    dependencies=[Depends(rate_limit_heavy_task(seconds=10))],
+)
 async def get_forensic_audit(
     limit: int = 200,
     x_role: str | None = Header(default=None, alias="X-Role"),

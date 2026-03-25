@@ -1,0 +1,83 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://accord.local/contracts/rera/allocation-response.schema.json",
+  "title": "RERAAllocationResponse",
+  "type": "object",
+  "required": [
+    "status",
+    "event_id",
+    "booking_id",
+    "payment_reference",
+    "event_type",
+    "allocation"
+  ],
+  "properties": {
+    "status": {
+      "type": "string",
+      "enum": ["ok"]
+    },
+    "event_id": {
+      "type": "integer",
+      "minimum": 1
+    },
+    "booking_id": {
+      "type": "string"
+    },
+    "payment_reference": {
+      "type": "string"
+    },
+    "event_type": {
+      "type": "string",
+      "enum": ["PAYMENT", "REFUND"]
+    },
+    "allocation": {
+      "type": "object",
+      "required": [
+        "receipt_amount",
+        "applied_rera_ratio",
+        "rera_amount",
+        "operations_amount",
+        "is_override"
+      ],
+      "properties": {
+        "receipt_amount": {
+          "type": "string",
+          "pattern": "^\\-?\\d+(\\.\\d{2})$"
+        },
+        "applied_rera_ratio": {
+          "type": "string",
+          "pattern": "^0\\.\\d{4}$"
+        },
+        "rera_amount": {
+          "type": "string",
+          "pattern": "^\\d+(\\.\\d{2})$"
+        },
+        "operations_amount": {
+          "type": "string",
+          "pattern": "^\\d+(\\.\\d{2})$"
+        },
+        "is_override": {
+          "type": "boolean"
+        }
+      },
+      "additionalProperties": false
+    },
+    "audit": {
+      "type": "object",
+      "properties": {
+        "override_reason": {
+          "type": ["string", "null"]
+        },
+        "actor_role": {
+          "type": "string"
+        },
+        "created_at": {
+          "type": "string",
+          "format": "date-time"
+        }
+      },
+      "additionalProperties": false
+    }
+  },
+  "additionalProperties": false
+}

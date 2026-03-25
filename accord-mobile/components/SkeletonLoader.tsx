@@ -16,7 +16,7 @@ import Animated, {
   interpolate,
   Extrapolate,
 } from 'react-native-reanimated';
-import { Spacing, AccordDarkTheme } from './AccordTheme';
+import { Spacing, AccordDarkTheme } from '../AccordTheme';
 
 interface SkeletonLineProps {
   width?: string | number;
@@ -70,7 +70,7 @@ export const SkeletonLine: React.FC<SkeletonLineProps> = ({
     <Animated.View
       style={[
         {
-          width,
+          width: width as any,
           height,
           backgroundColor: AccordDarkTheme.colors.surfaceVariant,
           borderRadius: 8,

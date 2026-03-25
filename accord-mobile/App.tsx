@@ -1,4 +1,4 @@
-import React, { useEffect, useMemo, useRef, useState } from "react";
+import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   AppState,
   AppStateStatus,
@@ -17,9 +17,16 @@ import Voice from "@react-native-voice/voice";
 import * as SecureStore from "expo-secure-store";
 import NetInfo from "@react-native-community/netinfo";
 import Animated from "react-native-reanimated";
+import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { AccordDarkTheme, Spacing } from "./AccordTheme";
 import { Skeleton } from "./components/SkeletonLoader";
+import { PrivacyShield } from "./components/PrivacyShield";
 import { usePulsingAnimation, useWaveAnimation, useFadeAnimation } from "./hooks/useVoiceAnimations";
+import { useOfflineVoiceQueue } from "./hooks/useOfflineVoiceQueue";
+import { useSyncWorker } from "./hooks/useSyncWorker";
+import { useAccordHaptics } from "./hooks/useAccordHaptics";
+import { SpvProvider } from "./src/context/SpvContext";
+import { registerPushNotifications, subscribePushTokenRefresh } from "./src/services/PushNotifications";
 
 type Txn = {
   payment_id: string;
@@ -43,7 +50,108 @@ const SSE_MAX_BACKOFF_MS = 20000;
 const SESSION_TOKEN_KEY = "accord.mobile.sessionToken";
 const SESSION_CREATED_KEY = "accord.mobile.sessionCreatedAt";
 
-export default function App() {
+const LANGUAGE_ORDER: Array<"en" | "hi" | "pa" | "ur"> = ["en", "hi", "pa", "ur"];
+const LANGUAGE_NAMES: Record<"en" | "hi" | "pa" | "ur", string> = {
+  en: "English",
+  hi: "हिंदी",
+  pa: "ਪੰਜਾਬੀ",
+  ur: "اردو",
+};
+
+const I18N: Record<string, Record<string, string>> = {
+  en: {
+    app_title: "Accord Network Mobile",
+    app_subtitle: "Simple finance flow for every user: voice, GST, UPI, and CA sync",
+    lang_switch: "Hindi",
+    simple_on: "Simple Mode: ON",
+    simple_off: "Simple Mode: OFF",
+    identity: "Identity",
+    gst_upi: "GST + UPI",
+    online_txn: "Online Transactions",
+    voice_ledger: "Voice To Ledger",
+    realtime: "Realtime Sync Monitor",
+    activity_log: "Activity Log",
+    start_session: "Start Mobile Session",
+    link_sme: "Link SME to CA",
+    start_voice: "Start Voice Session",
+    start_mic: "Start Mic",
+    stop_mic: "Stop Mic",
+    commit_ledger: "Commit To Ledger",
+    refresh: "Refresh",
+    reconnect_sse: "Reconnect SSE",
+    retry_chunks: "Retry Pending Chunks",
+  },
+  hi: {
+    app_title: "अकॉर्ड मोबाइल",
+    app_subtitle: "हर उम्र के लिए आसान: वॉइस, GST, UPI और CA सिंक",
+    lang_switch: "English",
+    simple_on: "सरल मोड: चालू",
+    simple_off: "सरल मोड: बंद",
+    identity: "पहचान",
+    gst_upi: "GST + UPI",
+    online_txn: "ऑनलाइन लेनदेन",
+    voice_ledger: "वॉइस से लेजर",
+    realtime: "रीयलटाइम सिंक मॉनिटर",
+    activity_log: "गतिविधि लॉग",
+    start_session: "मोबाइल सेशन शुरू करें",
+    link_sme: "SME को CA से जोड़ें",
+    start_voice: "वॉइस सेशन शुरू करें",
+    start_mic: "माइक शुरू करें",
+    stop_mic: "माइक रोकें",
+    commit_ledger: "लेजर में सेव करें",
+    refresh: "रीफ्रेश",
+    reconnect_sse: "SSE फिर से जोड़ें",
+    retry_chunks: "पेंडिंग चंक्स दोबारा भेजें",
+  },
+  pa: {
+    app_title: "ਅਕੋਰਡ ਮੋਬਾਈਲ",
+    app_subtitle: "ਹਰ ਉਮਰ ਲਈ ਆਸਾਨ: ਵੌਇਸ, GST, UPI ਅਤੇ CA ਸਿੰਕ",
+    lang_switch: "اردو",
+    simple_on: "ਸਧਾਰਨ ਮੋਡ: ਚਾਲੂ",
+    simple_off: "ਸਧਾਰਨ ਮੋਡ: ਬੰਦ",
+    identity: "ਪਛਾਣ",
+    gst_upi: "GST + UPI",
+    online_txn: "ਆਨਲਾਈਨ ਲੈਣ-ਦੇਣ",
+    voice_ledger: "ਵੌਇਸ ਤੋਂ ਲੇਜਰ",
+    realtime: "ਰੀਅਲਟਾਈਮ ਸਿੰਕ ਮਾਨੀਟਰ",
+    activity_log: "ਐਕਟਿਵਿਟੀ ਲਾਗ",
+    start_session: "ਮੋਬਾਈਲ ਸੈਸ਼ਨ ਸ਼ੁਰੂ ਕਰੋ",
+    link_sme: "SME ਨੂੰ CA ਨਾਲ ਜੋੜੋ",
+    start_voice: "ਵੌਇਸ ਸੈਸ਼ਨ ਸ਼ੁਰੂ ਕਰੋ",
+    start_mic: "ਮਾਈਕ ਸ਼ੁਰੂ ਕਰੋ",
+    stop_mic: "ਮਾਈਕ ਰੋਕੋ",
+    commit_ledger: "ਲੇਜਰ ਵਿੱਚ ਸੇਵ ਕਰੋ",
+    refresh: "ਰਿਫ੍ਰੈਸ਼",
+    reconnect_sse: "SSE ਮੁੜ ਜੋੜੋ",
+    retry_chunks: "ਪੈਂਡਿੰਗ ਚੰਕ ਮੁੜ ਭੇਜੋ",
+  },
+  ur: {
+    app_title: "اکورڈ موبائل",
+    app_subtitle: "ہر عمر کے لیے آسان: وائس، GST، UPI اور CA سنک",
+    lang_switch: "English",
+    simple_on: "سادہ موڈ: آن",
+    simple_off: "سادہ موڈ: آف",
+    identity: "شناخت",
+    gst_upi: "GST + UPI",
+    online_txn: "آن لائن لین دین",
+    voice_ledger: "وائس سے لیجر",
+    realtime: "ریئل ٹائم سنک مانیٹر",
+    activity_log: "ایکٹیویٹی لاگ",
+    start_session: "موبائل سیشن شروع کریں",
+    link_sme: "SME کو CA سے جوڑیں",
+    start_voice: "وائس سیشن شروع کریں",
+    start_mic: "مائیک شروع کریں",
+    stop_mic: "مائیک روکیں",
+    commit_ledger: "لیجر میں محفوظ کریں",
+    refresh: "ریفریش",
+    reconnect_sse: "SSE دوبارہ جوڑیں",
+    retry_chunks: "پینڈنگ چنکس دوبارہ بھیجیں",
+  },
+};
+
+const queryClient = new QueryClient();
+
+function AppScreen() {
   const { width } = useWindowDimensions();
   const isTablet = width >= 900;
   const gridColumns = isTablet ? 2 : 1;
@@ -70,13 +178,21 @@ export default function App() {
   const [sseStatus, setSseStatus] = useState("idle");
   const [lastSyncAt, setLastSyncAt] = useState("");
   const [liveEvents, setLiveEvents] = useState<RealtimeEvent[]>([]);
+  const [offlineSyncInFlight, setOfflineSyncInFlight] = useState(false);
+  const [language, setLanguage] = useState<"en" | "hi" | "pa" | "ur">("en");
+  const [simpleMode, setSimpleMode] = useState(true);
 
   const chunkQueueRef = useRef<string[]>([]);
+  const transcriptBufferRef = useRef<string[]>([]);
   const flushInFlightRef = useRef(false);
   const eventSourceRef = useRef<any>(null);
   const sseReconnectRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const sseBackoffRef = useRef(1200);
   const appStateRef = useRef<AppStateStatus>(AppState.currentState);
+  const pushBootstrapDoneRef = useRef(false);
+  const { triggerSuccess, triggerError, triggerTap, triggerHeavySync } = useAccordHaptics();
+  const t = (key: string) => I18N[language]?.[key] || I18N.en[key] || key;
+  const voiceLocale = language === "en" ? "en-IN" : "hi-IN";
 
   const headers = useMemo(
     () => ({
@@ -94,6 +210,16 @@ export default function App() {
     }),
     [headers, sessionToken]
   );
+
+  const {
+    pendingItems,
+    pendingCount,
+    queueCommit,
+    markFailed,
+    markSynced,
+    clearSynced,
+    loaded: offlineQueueLoaded,
+  } = useOfflineVoiceQueue();
 
   const appendLog = (line: string) => {
     setLog((prev: string) => `${new Date().toLocaleTimeString()} ${line}\n${prev}`);
@@ -176,6 +302,73 @@ export default function App() {
       }
     }
   };
+
+  const syncOfflineVoiceQueue = useCallback(async () => {
+    if (!networkOnline || pendingItems.length === 0 || !offlineQueueLoaded) {
+      return;
+    }
+    if (offlineSyncInFlight) {
+      return;
+    }
+
+    setOfflineSyncInFlight(true);
+    try {
+      const payload = {
+        entries: pendingItems.map((item) => ({
+          idempotency_key: item.idempotencyKey,
+          transcript: item.transcript,
+          currency_code: item.currencyCode,
+          exchange_rate: item.exchangeRate,
+          client_created_at: item.createdAt,
+        })),
+      };
+
+      const data = (await requestJson(
+        "/api/v2/mobile/voice/offline/sync/bulk",
+        {
+          method: "POST",
+          headers: buildHeaders,
+          body: JSON.stringify(payload),
+        },
+        { retries: 2 }
+      )) as {
+        results?: Array<{ idempotency_key?: string; status?: string; ledger_result?: { reference?: string; entry_id?: string } }>;
+      };
+
+      const results = Array.isArray(data.results) ? data.results : [];
+      for (const result of results) {
+        const key = String(result.idempotency_key || "");
+        if (!key) {
+          continue;
+        }
+        if (String(result.status || "").toLowerCase() === "ok") {
+          await markSynced(key, { ledgerResult: result.ledger_result });
+          if (result.ledger_result?.reference) {
+            appendLog(`Offline sync committed: ${result.ledger_result.reference}`);
+          }
+        } else {
+          await markFailed(key, "Offline sync failed");
+        }
+      }
+      await clearSynced();
+      if (results.some((result) => String(result.status || "").toLowerCase() === "ok")) {
+        await triggerHeavySync();
+      }
+    } catch (error) {
+      appendLog(`Offline sync paused: ${String(error)}`);
+    } finally {
+      setOfflineSyncInFlight(false);
+    }
+  }, [
+    buildHeaders,
+    clearSynced,
+    markFailed,
+    markSynced,
+    networkOnline,
+    offlineQueueLoaded,
+    offlineSyncInFlight,
+    pendingItems,
+  ]);
 
   const flushChunkQueue = async () => {
     if (flushInFlightRef.current || !voiceSessionId) {
@@ -351,6 +544,7 @@ export default function App() {
       const spoken = (event.value || []).join(" ").trim();
       if (!spoken) return;
       setLiveTranscript(spoken);
+      transcriptBufferRef.current.push(spoken);
       if (!voiceSessionId) return;
       chunkQueueRef.current.push(spoken);
       setQueuedChunks(chunkQueueRef.current.length);
@@ -391,8 +585,50 @@ export default function App() {
     return () => closeSse();
   }, [sessionToken, caId]);
 
+  useSyncWorker({
+    networkOnline,
+    onReconnect: syncOfflineVoiceQueue,
+    onOnlineHeartbeat: async () => {
+      if (pendingCount > 0) {
+        await syncOfflineVoiceQueue();
+      }
+    },
+  });
+
+  useEffect(() => {
+    if (pushBootstrapDoneRef.current) {
+      return;
+    }
+    pushBootstrapDoneRef.current = true;
+
+    let unsubscriber: (() => void) | null = null;
+    void (async () => {
+      const result = await registerPushNotifications({
+        apiBaseUrl: API_BASE,
+        headers,
+        userId: Number(caId) || 1001,
+      });
+      appendLog(`[Push] ${result.detail}`);
+
+      if (result.status === "registered") {
+        unsubscriber = subscribePushTokenRefresh({
+          apiBaseUrl: API_BASE,
+          headers,
+          userId: Number(caId) || 1001,
+        });
+      }
+    })();
+
+    return () => {
+      if (unsubscriber) {
+        unsubscriber();
+      }
+    };
+  }, [headers, caId]);
+
   const startSession = async () => {
     try {
+      await triggerTap();
       const data = (await requestJson(
         "/api/v2/mobile/auth/session",
         {
@@ -408,8 +644,10 @@ export default function App() {
       await SecureStore.setItemAsync(SESSION_TOKEN_KEY, token);
       await SecureStore.setItemAsync(SESSION_CREATED_KEY, new Date().toISOString());
       appendLog(`Session active: ${token}`);
+      await triggerSuccess();
     } catch (error) {
       appendLog(`Session error: ${String(error)}`);
+      await triggerError();
     }
   };
 
@@ -433,6 +671,7 @@ export default function App() {
 
   const requestApproval = async () => {
     try {
+      await triggerTap();
       const data = (await requestJson("/api/v2/mobile/gst/approve", {
         method: "POST",
         headers: buildHeaders,
@@ -443,13 +682,16 @@ export default function App() {
         }),
       })) as { filing_id?: number };
       appendLog(`GST approved: filing ${data.filing_id || filingId}`);
+      await triggerSuccess();
     } catch (error) {
       appendLog(`Approval error: ${String(error)}`);
+      await triggerError();
     }
   };
 
   const createUpiIntent = async () => {
     try {
+      await triggerTap();
       const data = (await requestJson("/api/v2/mobile/tax/upi/intent", {
         method: "POST",
         headers: buildHeaders,
@@ -462,8 +704,10 @@ export default function App() {
       })) as { payment_id?: string };
       setPaymentId(data.payment_id || "");
       appendLog(`UPI intent created: ${data.payment_id || "unknown"}`);
+      await triggerSuccess();
     } catch (error) {
       appendLog(`UPI intent error: ${String(error)}`);
+      await triggerError();
     }
   };
 
@@ -473,14 +717,17 @@ export default function App() {
       return;
     }
     try {
+      await triggerTap();
       const data = (await requestJson("/api/v2/mobile/tax/upi/webhook", {
         method: "POST",
         headers: buildHeaders,
         body: JSON.stringify({ payment_id: paymentId, gateway_status: "PAID", utr: "UTR-123456" }),
       })) as { ledger_state?: string };
       appendLog(`Ledger state: ${data.ledger_state || "UNKNOWN"}`);
+      await triggerSuccess();
     } catch (error) {
       appendLog(`Webhook error: ${String(error)}`);
+      await triggerError();
     }
   };
 
@@ -505,16 +752,19 @@ export default function App() {
         body: JSON.stringify({
           sme_id: Number(smeId),
           ca_id: Number(caId),
-          language: "en-IN",
+          language: voiceLocale,
         }),
       })) as { session_id?: string };
       setVoiceSessionId(data.session_id || "");
       setLiveTranscript("");
       chunkQueueRef.current = [];
+      transcriptBufferRef.current = [];
       setQueuedChunks(0);
       appendLog(`Voice session started: ${data.session_id || "unknown"}`);
+      await triggerSuccess();
     } catch (error) {
       appendLog(`Voice session error: ${String(error)}`);
+      await triggerError();
     }
   };
 
@@ -524,13 +774,15 @@ export default function App() {
       return;
     }
     try {
-      await Voice.start("en-IN");
+      await Voice.start(voiceLocale);
       setIsListening(true);
       setPausedBySystem(false);
       appendLog("Microphone listening started");
+      await triggerTap();
     } catch (error) {
       setIsListening(false);
       appendLog(`Microphone start failed: ${String(error)}`);
+      await triggerError();
     }
   };
 
@@ -550,10 +802,23 @@ export default function App() {
       return;
     }
     try {
+      const offlineTranscript = transcriptBufferRef.current.join(" ").trim() || liveTranscript.trim();
       if (isListening) {
         await Voice.stop();
         setIsListening(false);
       }
+
+      if (!networkOnline) {
+        const queuedKey = await queueCommit({
+          transcript: offlineTranscript,
+          currencyCode: voiceCurrency,
+          sessionId: voiceSessionId,
+        });
+        appendLog(`Offline commit queued (${queuedKey || "pending"})`);
+        setLastVoiceEntry("Queued offline - will auto-sync when online");
+        return;
+      }
+
       await flushChunkQueue();
       const data = (await requestJson("/api/v2/mobile/voice/session/commit", {
         method: "POST",
@@ -566,38 +831,68 @@ export default function App() {
       const reference = data?.ledger_result?.reference || "";
       const entryId = data?.ledger_result?.entry_id || "";
       setLastVoiceEntry(`${reference} (entry ${entryId})`);
+      transcriptBufferRef.current = [];
       appendLog(`Voice committed to ledger: ${reference}`);
+      await triggerSuccess();
     } catch (error) {
-      appendLog(`Voice commit error: ${String(error)}`);
+      const fallbackTranscript = transcriptBufferRef.current.join(" ").trim() || liveTranscript.trim();
+      if (fallbackTranscript) {
+        const queuedKey = await queueCommit({
+          transcript: fallbackTranscript,
+          currencyCode: voiceCurrency,
+          sessionId: voiceSessionId,
+        });
+        setLastVoiceEntry("Queued offline after sync failure");
+        appendLog(`Voice commit deferred (${queuedKey || "pending"}): ${String(error)}`);
+      } else {
+        appendLog(`Voice commit error: ${String(error)}`);
+      }
+      await triggerError();
     }
   };
 
   return (
     <PaperProvider theme={AccordDarkTheme}>
+      <PrivacyShield>
       <SafeAreaView style={styles.root}>
         <StatusBar barStyle="light-content" backgroundColor={AccordDarkTheme.colors.background} />
         <ScrollView contentContainerStyle={styles.container}>
-        <Text style={styles.title}>Accord Network Mobile</Text>
-        <Text style={styles.subtitle}>iOS + Android, phone + tablet, CA approvals and UPI tax flow</Text>
+        <View style={styles.rowBetween}>
+          <TouchableOpacity
+            style={styles.inlineButton}
+            onPress={() =>
+              setLanguage((prev) => LANGUAGE_ORDER[(LANGUAGE_ORDER.indexOf(prev) + 1) % LANGUAGE_ORDER.length])
+            }
+          >
+            <Text style={styles.inlineButtonText}>{LANGUAGE_NAMES[language]}</Text>
+          </TouchableOpacity>
+          <TouchableOpacity style={styles.inlineButton} onPress={() => setSimpleMode((prev) => !prev)}>
+            <Text style={styles.inlineButtonText}>{simpleMode ? t("simple_on") : t("simple_off")}</Text>
+          </TouchableOpacity>
+        </View>
+        <Text style={[styles.title, simpleMode ? styles.titleSimple : null]}>{t("app_title")}</Text>
+        <Text style={[styles.subtitle, simpleMode ? styles.subtitleSimple : null]}>{t("app_subtitle")}</Text>
 
         {!networkOnline ? <Text style={styles.bannerWarn}>Offline mode: requests will retry when network returns.</Text> : null}
         {retryingRequest ? <Text style={styles.bannerInfo}>Retrying unstable network request...</Text> : null}
+        {pendingCount > 0 ? <Text style={styles.bannerInfo}>Offline voice queue: {pendingCount} pending entr{pendingCount === 1 ? "y" : "ies"}.</Text> : null}
+        {offlineSyncInFlight ? <Text style={styles.bannerInfo}>Sync worker running: pushing queued voice entries...</Text> : null}
         {sessionExpired ? <Text style={styles.bannerWarn}>Session expired: start mobile session to continue.</Text> : null}
         {pausedBySystem ? <Text style={styles.bannerInfo}>Voice paused by OS interruption. Tap Start Mic to resume.</Text> : null}
 
         <View style={[styles.grid, { flexDirection: isTablet ? "row" : "column" }]}> 
           <View style={[styles.card, { width: `${100 / gridColumns}%` }]}> 
-            <Text style={styles.cardTitle}>Identity</Text>
+            <Text style={styles.cardTitle}>{t("identity")}</Text>
             <TextInput style={styles.input} value={smeId} onChangeText={setSmeId} placeholder="SME ID" placeholderTextColor="#8ca0c0" />
             <TextInput style={styles.input} value={caId} onChangeText={setCaId} placeholder="CA ID" placeholderTextColor="#8ca0c0" />
-            <TouchableOpacity style={styles.button} onPress={startSession}><Text style={styles.buttonText}>Start Mobile Session</Text></TouchableOpacity>
-            <TouchableOpacity style={styles.button} onPress={connectCA}><Text style={styles.buttonText}>Link SME to CA</Text></TouchableOpacity>
+            <TouchableOpacity style={styles.button} onPress={startSession}><Text style={styles.buttonText}>{t("start_session")}</Text></TouchableOpacity>
+            <TouchableOpacity style={styles.button} onPress={connectCA}><Text style={styles.buttonText}>{t("link_sme")}</Text></TouchableOpacity>
             <Text style={styles.meta}>Session: {sessionToken || "not started"}</Text>
             <Text style={styles.meta}>Realtime: {sseStatus}{lastSyncAt ? ` (last sync ${lastSyncAt})` : ""}</Text>
           </View>
 
           <View style={[styles.card, { width: `${100 / gridColumns}%` }]}> 
-            <Text style={styles.cardTitle}>GST + UPI</Text>
+            <Text style={styles.cardTitle}>{t("gst_upi")}</Text>
             <TextInput style={styles.input} value={filingId} onChangeText={setFilingId} placeholder="Filing ID" placeholderTextColor="#8ca0c0" />
             <TextInput style={styles.input} value={amount} onChangeText={setAmount} placeholder="Amount INR" placeholderTextColor="#8ca0c0" />
             <TextInput style={styles.input} value={challanRef} onChangeText={setChallanRef} placeholder="Challan Ref" placeholderTextColor="#8ca0c0" />
@@ -610,8 +905,8 @@ export default function App() {
 
         <View style={styles.cardFull}>
           <View style={styles.rowBetween}>
-            <Text style={styles.cardTitle}>Online Transactions</Text>
-            <TouchableOpacity style={styles.inlineButton} onPress={refreshTransactions}><Text style={styles.inlineButtonText}>Refresh</Text></TouchableOpacity>
+            <Text style={styles.cardTitle}>{t("online_txn")}</Text>
+            <TouchableOpacity style={styles.inlineButton} onPress={refreshTransactions}><Text style={styles.inlineButtonText}>{t("refresh")}</Text></TouchableOpacity>
           </View>
           {transactions.map((txn: Txn) => (
             <View key={txn.payment_id} style={styles.txnRow}>
@@ -624,10 +919,10 @@ export default function App() {
         </View>
 
         <View style={styles.cardFull}>
-          <Text style={styles.cardTitle}>Voice To Ledger</Text>
+          <Text style={styles.cardTitle}>{t("voice_ledger")}</Text>
           <View style={styles.rowBetween}>
             <TouchableOpacity style={styles.inlineButton} onPress={startVoiceSession}>
-              <Text style={styles.inlineButtonText}>Start Voice Session</Text>
+              <Text style={styles.inlineButtonText}>{t("start_voice")}</Text>
             </TouchableOpacity>
             <Text style={styles.meta}>{voiceSessionId ? "Session Active" : "No Session"}</Text>
           </View>
@@ -645,10 +940,10 @@ export default function App() {
               style={[styles.button, isListening ? styles.buttonWarn : null]}
               onPress={isListening ? stopMic : startMic}
             >
-              <Text style={styles.buttonText}>{isListening ? "Stop Mic" : "Start Mic"}</Text>
+              <Text style={styles.buttonText}>{isListening ? t("stop_mic") : t("start_mic")}</Text>
             </TouchableOpacity>
             <TouchableOpacity style={styles.button} onPress={commitVoiceToLedger}>
-              <Text style={styles.buttonText}>Commit To Ledger</Text>
+              <Text style={styles.buttonText}>{t("commit_ledger")}</Text>
             </TouchableOpacity>
           </View>
 
@@ -656,15 +951,15 @@ export default function App() {
           <Text style={styles.meta}>Last voice posting: {lastVoiceEntry || "none"}</Text>
           <Text style={styles.meta}>Queued voice chunks: {queuedChunks}</Text>
           <TouchableOpacity style={styles.inlineButton} onPress={flushChunkQueue}>
-            <Text style={styles.inlineButtonText}>Retry Pending Chunks</Text>
+            <Text style={styles.inlineButtonText}>{t("retry_chunks")}</Text>
           </TouchableOpacity>
         </View>
 
         <View style={styles.cardFull}>
           <View style={styles.rowBetween}>
-            <Text style={styles.cardTitle}>Realtime Sync Monitor</Text>
+            <Text style={styles.cardTitle}>{t("realtime")}</Text>
             <TouchableOpacity style={styles.inlineButton} onPress={connectSse}>
-              <Text style={styles.inlineButtonText}>Reconnect SSE</Text>
+              <Text style={styles.inlineButtonText}>{t("reconnect_sse")}</Text>
             </TouchableOpacity>
           </View>
           <Text style={styles.meta}>Status: {sseStatus}</Text>
@@ -680,12 +975,23 @@ export default function App() {
         </View>
 
         <View style={styles.cardFull}>
-          <Text style={styles.cardTitle}>Activity Log</Text>
+          <Text style={styles.cardTitle}>{t("activity_log")}</Text>
           <Text style={styles.log}>{log}</Text>
         </View>
       </ScrollView>
       </SafeAreaView>
+      </PrivacyShield>
     </PaperProvider>
+  );
+}
+
+export default function App() {
+  return (
+    <QueryClientProvider client={queryClient}>
+      <SpvProvider>
+        <AppScreen />
+      </SpvProvider>
+    </QueryClientProvider>
   );
 }
 
@@ -694,6 +1000,8 @@ const styles = StyleSheet.create({
   container: { padding: 16, gap: 12 },
   title: { color: "#e8f0ff", fontSize: 28, fontWeight: "800" },
   subtitle: { color: "#9fb2ce", fontSize: 13, marginBottom: 8 },
+  titleSimple: { fontSize: 34, lineHeight: 40 },
+  subtitleSimple: { fontSize: 16, lineHeight: 22 },
   grid: { gap: 10 },
   card: {
     backgroundColor: "#131d30",

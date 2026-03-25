@@ -10,5 +10,6 @@
     "types": ["react", "react-native"],
     "skipLibCheck": true
   },
-  "include": ["App.tsx", "**/*.d.ts"]
+  "include": ["App.tsx", "**/*.d.ts"],
+  "exclude": ["node_modules", "node_modules.bak*", "**/node_modules.bak*"]
 }

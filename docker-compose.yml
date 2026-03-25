@@ -1,48 +1,43 @@
 services:
-  postgres:
-    image: postgres:16-alpine
-    container_name: accord-postgres
-    environment:
-      POSTGRES_DB: accord
-      POSTGRES_USER: accord
-      POSTGRES_PASSWORD: accord
-    ports:
-      - "5432:5432"
-    volumes:
-      - accord_pg_data:/var/lib/postgresql/data
-    healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U accord -d accord"]
-      interval: 10s
-      timeout: 5s
-      retries: 5
-
   backend:
     build:
-      context: ./cloud-backend
+      context: .
+      dockerfile: Dockerfile.backend
     container_name: accord-backend
     environment:
+      DATABASE_URL: ${DATABASE_URL:-sqlite:////app/data/ledger.db}
+      ACCORD_BACKUP_DIR: ${ACCORD_BACKUP_DIR:-/app/backups}
+      ACCORD_BACKUP_RETENTION_DAYS: ${ACCORD_BACKUP_RETENTION_DAYS:-7}
       OLLAMA_HOST: ${OLLAMA_HOST:-http://host.docker.internal:11434}
-      GSTN_ECL_BASE_URL: ""
-      GSTN_ECL_TOKEN: ""
-      ACCORD_BIOMETRIC_SECRET: "change-this-in-production"
-      # Runtime is currently sqlite3; keep postgres service warm for migration cutover.
-      DATABASE_URL: sqlite:////app/ledger.db
-    depends_on:
-      postgres:
-        condition: service_healthy
+      ACCORD_BIOMETRIC_SECRET: ${ACCORD_BIOMETRIC_SECRET:-change-this-in-production}
+      ACCORD_SSE_TOKEN_SECRET: ${ACCORD_SSE_TOKEN_SECRET:-change-this-in-production}
+      CORS_ALLOW_ORIGINS: ${CORS_ALLOW_ORIGINS:-http://localhost:3000}
+      ACCORD_SMTP_HOST: ${ACCORD_SMTP_HOST}
+      ACCORD_SMTP_PORT: ${ACCORD_SMTP_PORT}
+      ACCORD_SMTP_USERNAME: ${ACCORD_SMTP_USERNAME}
+      ACCORD_SMTP_PASSWORD: ${ACCORD_SMTP_PASSWORD}
+      ACCORD_SMTP_FROM: ${ACCORD_SMTP_FROM}
+      ACCORD_SMTP_USE_TLS: ${ACCORD_SMTP_USE_TLS}
     ports:
       - "8000:8000"
     volumes:
-      - ./cloud-backend:/app
+      - accord_backend_db:/app/data
+      - accord_backend_backups:/app/backups
+    restart: unless-stopped
 
   frontend:
     build:
-      context: ./friday-insights
+      context: .
+      dockerfile: Dockerfile.frontend
+      args:
+        VITE_API_BASE_URL: ${VITE_API_BASE_URL:-/api/v1}
     container_name: accord-frontend
     depends_on:
       - backend
     ports:
       - "3000:80"
+    restart: unless-stopped
 
 volumes:
-  accord_pg_data:
+  accord_backend_db:
+  accord_backend_backups:

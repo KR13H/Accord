@@ -17,3 +17,7 @@ pydub
 networkx
 twilio
 redis
+celery
+thefuzz
+python-Levenshtein
+polars
