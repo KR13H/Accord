@@ -1,0 +1,4 @@
+{
+  "template_id": "rent_reminder_pa",
+  "message": "ਸੱਤ ਸ੍ਰੀ ਅਕਾਲ ਕਿਰਾਏਦਾਰ {tenant_id}, ਤੁਹਾਡਾ ਕਿਰਾਇਆ INR {amount_due} ਮਿਤੀ {due_date} ਨੂੰ ਦੇਣਾ ਹੈ। ਦੇਰੀ ਸ਼ੁਲਕ ਤੋਂ ਬਚਣ ਲਈ ਸਮੇਂ ਤੇ ਭੁਗਤਾਨ ਕਰੋ।"
+}

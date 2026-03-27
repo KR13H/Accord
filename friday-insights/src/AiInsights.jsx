@@ -3,21 +3,32 @@ import {
   AlertTriangle,
   ArrowRight,
   BadgeAlert,
+  BarChart3,
+  Building2,
   Bot,
   BrainCircuit,
   Camera,
   CheckCircle2,
   FileCode2,
+  FileSearch,
   Fingerprint,
+  Handshake,
+  Layers,
   Loader2,
+  Mic,
   PanelLeft,
   Radar,
+  Send,
+  Smartphone,
   Sparkles,
   ShieldAlert,
+  Upload,
+  UserPlus,
   Zap,
 } from "lucide-react";
 import { AnimatePresence, motion } from "framer-motion";
 import "./AiInsights.css";
+import NexusGraph from "./NexusGraph";
 
 function formatINR(value) {
   const num = Number(value ?? 0);
@@ -98,6 +109,53 @@ function ComplianceGauge({ score }) {
   );
 }
 
+function M3CoreMonitor({ telemetry, neuralActive, mistralReady }) {
+  const cpuLoad = Math.max(2, Math.min(100, Number(telemetry?.cpu_percent || 0)));
+  const workerLoad = Math.max(2, Math.min(100, (Number(telemetry?.active_workers || 0) / 10) * 100));
+  const ramLoad = telemetry?.ram_total_gb
+    ? Math.max(2, Math.min(100, (Number(telemetry.ram_used_gb || 0) / Number(telemetry.ram_total_gb)) * 100))
+    : 2;
+  const signals = [
+    { key: "cpu", label: "CPU Saturation", value: cpuLoad, tone: "bg-white shadow-[0_0_16px_rgba(255,255,255,0.85)]" },
+    { key: "workers", label: "Worker Pool", value: workerLoad, tone: "bg-slate-200" },
+    { key: "ram", label: "RAM Load", value: ramLoad, tone: "bg-emerald-300" },
+  ];
+
+  return (
+    <div className="rounded-2xl border border-white/20 bg-black/70 p-4 glass-panel">
+      <div className="flex items-center justify-between gap-3">
+        <p className="text-xs uppercase tracking-[0.22em] text-cyan-200">M3 Core Monitor</p>
+        <span className={`text-[10px] font-semibold tracking-[0.18em] ${mistralReady ? "text-emerald-300" : "text-amber-300"}`}>
+          {mistralReady ? "MISTRAL READY" : "MISTRAL WARMING"}
+        </span>
+      </div>
+      <div className="mt-3 space-y-2">
+        {signals.map((signal) => (
+          <div key={signal.key}>
+            <div className="flex items-center justify-between text-[11px] text-slate-300">
+              <span>{signal.label}</span>
+              <span className="mono-metrics">{signal.value}%</span>
+            </div>
+            <div className="h-2 rounded-full bg-slate-900/90 overflow-hidden mt-1">
+              <motion.div
+                className={`h-full ${signal.tone}`}
+                animate={{ width: `${signal.value}%`, opacity: [0.5, 1, 0.65] }}
+                transition={{ duration: 0.75, ease: "easeOut" }}
+              />
+            </div>
+          </div>
+        ))}
+      </div>
+      <div className="mt-3 flex items-center justify-between text-[11px] text-slate-400">
+        <span>Workers: {telemetry?.active_workers ?? 0} / {telemetry?.max_workers ?? 10}</span>
+        <span className={neuralActive ? "text-cyan-300 drop-shadow-[0_0_10px_rgba(34,211,238,0.9)]" : "text-slate-500"}>
+          Neural Engine {neuralActive ? "ACTIVE" : "IDLE"}
+        </span>
+      </div>
+    </div>
+  );
+}
+
 export default function AiInsights() {
   const [summary, setSummary] = useState(null);
   const [loading, setLoading] = useState(true);
@@ -136,10 +194,45 @@ export default function AiInsights() {
   const [isUploadingReceipt, setIsUploadingReceipt] = useState(false);
   const [receiptError, setReceiptError] = useState("");
   const [receiptResult, setReceiptResult] = useState(null);
+  const [isMobileSyncing, setIsMobileSyncing] = useState(false);
+  const [mobileSyncActive, setMobileSyncActive] = useState(false);
+  const [mobileSyncResult, setMobileSyncResult] = useState(null);
   const [isExportingTally, setIsExportingTally] = useState(false);
   const [isBatchUploading, setIsBatchUploading] = useState(false);
   const [batchUploadError, setBatchUploadError] = useState("");
   const [batchUploadResults, setBatchUploadResults] = useState(null);
+  const [isNeuralInking, setIsNeuralInking] = useState(false);
+  const [neuralInkError, setNeuralInkError] = useState("");
+  const [neuralInkResult, setNeuralInkResult] = useState(null);
+  const [forensicAudit, setForensicAudit] = useState(null);
+  const [forensicError, setForensicError] = useState("");
+  const [isForensicLoading, setIsForensicLoading] = useState(false);
+  const [mistralReady, setMistralReady] = useState(false);
+  const [telemetry, setTelemetry] = useState(null);
+  const [forensicStreamText, setForensicStreamText] = useState("");
+  const [deckMode, setDeckMode] = useState(false);
+  const [omniResult, setOmniResult] = useState(null);
+  const [omniError, setOmniError] = useState("");
+  const [isOmniUploading, setIsOmniUploading] = useState(false);
+  const [omniUploadProgress, setOmniUploadProgress] = useState(0);
+  const [isRetryingOmniFailed, setIsRetryingOmniFailed] = useState(false);
+  const [voiceResult, setVoiceResult] = useState(null);
+  const [voiceError, setVoiceError] = useState("");
+  const [isVoiceUploading, setIsVoiceUploading] = useState(false);
+  const [reconcileResult, setReconcileResult] = useState(null);
+  const [reconcileError, setReconcileError] = useState("");
+  const [isReconciling2b, setIsReconciling2b] = useState(false);
+  const [radarRiskFilter, setRadarRiskFilter] = useState("ALL");
+  const [radarSortMode, setRadarSortMode] = useState("RISK_DESC");
+  const [nexusGraphData, setNexusGraphData] = useState(null);
+  const [isNudgingGhost, setIsNudgingGhost] = useState({});
+  const [selectedRiskNode, setSelectedRiskNode] = useState(null);
+  const [riskNudgePhone, setRiskNudgePhone] = useState("");
+  const [m3PulseHistory, setM3PulseHistory] = useState([]);
+  const [caInviteEmail, setCaInviteEmail] = useState("");
+  const [isInvitingCa, setIsInvitingCa] = useState(false);
+  const [caInviteResult, setCaInviteResult] = useState(null);
+  const [caInviteError, setCaInviteError] = useState("");
 
   useEffect(() => {
     if (!fridayAnswer) {
@@ -157,6 +250,533 @@ export default function AiInsights() {
     }, 14);
     return () => clearInterval(timer);
   }, [fridayAnswer]);
+
+  useEffect(() => {
+    if (!forensicAudit?.audit_report) {
+      setForensicStreamText("");
+      return;
+    }
+    setForensicStreamText("");
+    let cursor = 0;
+    const source = String(forensicAudit.audit_report);
+    const timer = setInterval(() => {
+      cursor += 8;
+      setForensicStreamText(source.slice(0, cursor));
+      if (cursor >= source.length) {
+        clearInterval(timer);
+      }
+    }, 18);
+    return () => clearInterval(timer);
+  }, [forensicAudit]);
+
+  const fetchTelemetry = async () => {
+    try {
+      const res = await fetch("/api/v1/system/m3-telemetry");
+      const data = await res.json();
+      if (res.ok) {
+        setTelemetry(data);
+        setM3PulseHistory((prev) => {
+          const next = [
+            ...prev,
+            {
+              ts: Date.now(),
+              cpu: Number(data?.cpu_percent || 0),
+              workers: Number(data?.active_workers || 0),
+            },
+          ];
+          return next.slice(-40);
+        });
+      }
+    } catch {
+      // keep last known telemetry snapshot
+    }
+  };
+
+  const refreshNexusGraph = async () => {
+    try {
+      const res = await fetch("/api/v1/ledger/nexus-graph/latest", {
+        headers: {
+          "X-Role": adminRole,
+          "X-Admin-Id": adminId,
+        },
+      });
+      const data = await res.json();
+      if (res.ok) {
+        setNexusGraphData(data);
+      }
+    } catch {
+      // graph may not exist yet
+    }
+  };
+
+  const refreshModelHealth = async () => {
+    try {
+      const res = await fetch("/api/v1/insights/friday-health?model=mistral");
+      const data = await res.json();
+      setMistralReady(Boolean(data?.model_ready));
+    } catch {
+      setMistralReady(false);
+    }
+  };
+
+  const fetchForensicAudit = async () => {
+    setIsForensicLoading(true);
+    setForensicError("");
+    setForensicStreamText("");
+    try {
+      const res = await fetch("/api/v1/insights/forensic-audit?limit=250", {
+        method: "POST",
+        headers: {
+          "X-Role": adminRole,
+          "X-Admin-Id": adminId,
+        },
+      });
+      const data = await res.json();
+      if (!res.ok) {
+        throw new Error(data?.detail || `Forensic audit failed (${res.status})`);
+      }
+      setForensicAudit(data);
+    } catch (err) {
+      setForensicError(err instanceof Error ? err.message : "Failed to load forensic audit");
+    } finally {
+      setIsForensicLoading(false);
+    }
+  };
+
+  const uploadNeuralInk = async (file) => {
+    if (!file) {
+      return;
+    }
+    setIsNeuralInking(true);
+    setNeuralInkError("");
+    setNeuralInkResult(null);
+    try {
+      const formData = new FormData();
+      formData.append("file", file);
+      const res = await fetch("/api/v1/ledger/neural-ink", {
+        method: "POST",
+        headers: {
+          "X-Role": adminRole,
+          "X-Admin-Id": adminId,
+        },
+        body: formData,
+      });
+      const data = await res.json();
+      if (!res.ok) {
+        throw new Error(data?.detail || `Neural-Ink failed (${res.status})`);
+      }
+      setNeuralInkResult(data);
+      setWizardResult(`Neural-Ink posted ${data.reference} and generated ${data.tally_export_file}.`);
+      await fetchSummary();
+    } catch (err) {
+      setNeuralInkError(err instanceof Error ? err.message : "Failed to run Neural-Ink");
+    } finally {
+      setIsNeuralInking(false);
+    }
+  };
+
+  const uploadOmniIngest = async (incoming) => {
+    const files = Array.isArray(incoming)
+      ? incoming
+      : incoming instanceof FileList
+        ? Array.from(incoming)
+        : incoming
+          ? [incoming]
+          : [];
+
+    if (files.length === 0) {
+      return;
+    }
+    setIsOmniUploading(true);
+    setOmniUploadProgress(0);
+    setOmniError("");
+    setOmniResult(null);
+    try {
+      const formData = new FormData();
+      const endpoint = files.length > 1 ? "/api/v1/ledger/ingest-batch" : "/api/v1/ledger/ingest";
+      if (files.length > 1) {
+        files.forEach((file) => formData.append("files", file));
+      } else {
+        formData.append("file", files[0]);
+      }
+
+      const { status, data } = await new Promise((resolve, reject) => {
+        const xhr = new XMLHttpRequest();
+        xhr.open("POST", endpoint);
+        xhr.responseType = "json";
+        xhr.setRequestHeader("X-Role", adminRole);
+        xhr.setRequestHeader("X-Admin-Id", adminId);
+        xhr.upload.onprogress = (event) => {
+          if (!event.lengthComputable) {
+            return;
+          }
+          const nextProgress = Math.round((event.loaded / event.total) * 100);
+          setOmniUploadProgress(Math.max(1, Math.min(100, nextProgress)));
+        };
+        xhr.onerror = () => reject(new Error("Network error during Omni ingest upload"));
+        xhr.onload = () => {
+          const payload = xhr.response ?? {};
+          resolve({ status: xhr.status, data: payload });
+        };
+        xhr.send(formData);
+      });
+
+      if (!(status >= 200 && status < 300)) {
+        throw new Error(data?.detail || data?.error?.detail || `Omni ingest failed (${status})`);
+      }
+
+      setOmniUploadProgress(100);
+      setOmniResult(data);
+      if (files.length > 1) {
+        setWizardResult(`Omni mixed-batch posted ${data.posted_entries ?? 0}/${data.submitted ?? files.length} file(s).`);
+      } else {
+        setWizardResult(`Omni-Reader posted ${data.entries_created} entry(s) from ${files[0].name}.`);
+      }
+      await fetchSummary();
+    } catch (err) {
+      setOmniError(err instanceof Error ? err.message : "Failed Omni ingestion");
+    } finally {
+      setIsOmniUploading(false);
+      setTimeout(() => setOmniUploadProgress(0), 1200);
+    }
+  };
+
+  const uploadVoiceCommand = async (file) => {
+    if (!file) {
+      return;
+    }
+    setIsVoiceUploading(true);
+    setVoiceError("");
+    setVoiceResult(null);
+    try {
+      const formData = new FormData();
+      formData.append("file", file);
+      const res = await fetch("/api/v1/ledger/voice-cmd", {
+        method: "POST",
+        headers: {
+          "X-Role": adminRole,
+          "X-Admin-Id": adminId,
+        },
+        body: formData,
+      });
+      const data = await res.json();
+      if (!res.ok) {
+        throw new Error(data?.detail || `Voice command failed (${res.status})`);
+      }
+      setVoiceResult(data);
+      setWizardResult(`Voice voucher posted as ${data.reference}.`);
+      await fetchSummary();
+    } catch (err) {
+      setVoiceError(err instanceof Error ? err.message : "Failed voice command ingestion");
+    } finally {
+      setIsVoiceUploading(false);
+    }
+  };
+
+  const retryFailedOmniBatch = async () => {
+    const retryBatchId = omniResult?.retry_batch_id;
+    if (!retryBatchId) {
+      return;
+    }
+    setIsRetryingOmniFailed(true);
+    setOmniError("");
+    try {
+      const res = await fetch("/api/v1/ledger/ingest-batch/retry-failed", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "X-Role": adminRole,
+          "X-Admin-Id": adminId,
+        },
+        body: JSON.stringify({ batch_id: retryBatchId }),
+      });
+      const data = await res.json();
+      if (!res.ok) {
+        throw new Error(data?.detail || `Retry failed (${res.status})`);
+      }
+
+      setOmniResult((prev) => {
+        const prevResults = Array.isArray(prev?.results) ? prev.results : [];
+        return {
+          ...(prev || {}),
+          ...data,
+          retry_batch_id: retryBatchId,
+          results: [...prevResults, ...(Array.isArray(data?.results) ? data.results : [])],
+        };
+      });
+      setWizardResult(`Retry complete: posted ${data.posted_entries}, remaining failed ${data.failed_entries}.`);
+      await fetchSummary();
+    } catch (err) {
+      setOmniError(err instanceof Error ? err.message : "Failed retry for batch files");
+    } finally {
+      setIsRetryingOmniFailed(false);
+    }
+  };
+
+  const upload2bReconciliation = async (file) => {
+    if (!file) {
+      return;
+    }
+    setIsReconciling2b(true);
+    setReconcileError("");
+    setReconcileResult(null);
+    try {
+      const formData = new FormData();
+      formData.append("file", file);
+      const res = await fetch("/api/v1/ledger/reconcile-2b", {
+        method: "POST",
+        headers: {
+          "X-Role": adminRole,
+          "X-Admin-Id": adminId,
+        },
+        body: formData,
+      });
+      const data = await res.json();
+      if (!res.ok) {
+        throw new Error(data?.detail || `2B reconciliation failed (${res.status})`);
+      }
+      setReconcileResult({
+        ...data,
+        ghost_invoices: (data.ghost_invoices || []).map((row) => ({
+          ...row,
+          risk_level: String(row?.risk_level || "LOW").toUpperCase(),
+          nudge_status: String(row?.nudge_status || "PENDING").toUpperCase(),
+        })),
+      });
+      setNexusGraphData(data.nexus_graph || null);
+      setWizardResult(`2B reconciliation complete: ${data.ghost_invoices_count} ghost invoice(s) detected.`);
+      await fetchSummary();
+    } catch (err) {
+      setReconcileError(err instanceof Error ? err.message : "Failed 2B reconciliation");
+    } finally {
+      setIsReconciling2b(false);
+    }
+  };
+
+  const sendGhostNudge = async (item) => {
+    const key = `${item.entry_id}`;
+    setIsNudgingGhost((prev) => ({ ...prev, [key]: true }));
+    setReconcileResult((prev) => {
+      if (!prev?.ghost_invoices) {
+        return prev;
+      }
+      return {
+        ...prev,
+        ghost_invoices: prev.ghost_invoices.map((row) =>
+          row.entry_id === item.entry_id ? { ...row, nudge_status: "PENDING" } : row
+        ),
+      };
+    });
+    try {
+      const res = await fetch("/api/v1/ledger/nudge-vendor", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "X-Role": adminRole,
+          "X-Admin-Id": adminId,
+        },
+        body: JSON.stringify({
+          gstin: item.gstin,
+          vendor_name: item.vendor_name,
+          invoice_reference: item.reference,
+          invoice_amount: item.taxable_value,
+          mismatch_reason: "Invoice missing from uploaded GSTR-2B",
+        }),
+      });
+      const data = await res.json();
+      if (!res.ok) {
+        throw new Error(data?.detail || `Nudge generation failed (${res.status})`);
+      }
+      const message = data?.whatsapp_message || "Nudge generated.";
+      setReconcileResult((prev) => {
+        if (!prev?.ghost_invoices) {
+          return prev;
+        }
+        const nextStatus = String(data?.nudge_status || "PENDING").toUpperCase();
+        return {
+          ...prev,
+          ghost_invoices: prev.ghost_invoices.map((row) =>
+            row.entry_id === item.entry_id
+              ? {
+                  ...row,
+                  nudge_status: nextStatus,
+                  nudge_template: {
+                    ...(row.nudge_template || {}),
+                    message,
+                    urgency: data?.urgency || row?.nudge_template?.urgency,
+                  },
+                }
+              : row
+          ),
+        };
+      });
+    } catch (err) {
+      setReconcileError(err instanceof Error ? err.message : "Failed to nudge vendor");
+      setReconcileResult((prev) => {
+        if (!prev?.ghost_invoices) {
+          return prev;
+        }
+        return {
+          ...prev,
+          ghost_invoices: prev.ghost_invoices.map((row) =>
+            row.entry_id === item.entry_id ? { ...row, nudge_status: "FAILED" } : row
+          ),
+        };
+      });
+    } finally {
+      setIsNudgingGhost((prev) => ({ ...prev, [key]: false }));
+    }
+  };
+
+  const sendRiskNodeNudge = async () => {
+    if (!selectedRiskNode?.id) {
+      return;
+    }
+
+    const gstinCandidate = String(selectedRiskNode.id || "").trim().toUpperCase();
+    if (!/^[0-9A-Z]{15}$/.test(gstinCandidate)) {
+      setReconcileError("Selected risk node is not a valid GSTIN vendor node.");
+      return;
+    }
+
+    const key = `risk-${gstinCandidate}`;
+    setIsNudgingGhost((prev) => ({ ...prev, [key]: true }));
+    try {
+      const matchedGhost = (reconcileResult?.ghost_invoices || []).find((row) => String(row?.gstin || "").toUpperCase() === gstinCandidate);
+      const res = await fetch("/api/v1/ledger/nudge-vendor", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "X-Role": adminRole,
+          "X-Admin-Id": adminId,
+        },
+        body: JSON.stringify({
+          gstin: gstinCandidate,
+          vendor_name: matchedGhost?.vendor_name || selectedRiskNode?.id,
+          invoice_reference: matchedGhost?.reference,
+          invoice_amount: matchedGhost?.taxable_value,
+          phone_number: riskNudgePhone.trim() || undefined,
+          mismatch_reason: "Selected as high-risk from Nexus force graph",
+        }),
+      });
+      const data = await res.json();
+      if (!res.ok) {
+        throw new Error(data?.detail || `Risk-node nudge failed (${res.status})`);
+      }
+
+      setSelectedRiskNode((prev) => {
+        if (!prev) {
+          return prev;
+        }
+        return {
+          ...prev,
+          urgency: data?.urgency || "HIGH",
+          last_message: data?.whatsapp_message || "",
+        };
+      });
+      setWizardResult(`Risk-node nudge generated for ${gstinCandidate}.`);
+      if (riskNudgePhone.trim()) {
+        setWizardResult(`Risk-node nudge dispatched for ${gstinCandidate} via WhatsApp channel.`);
+      }
+    } catch (err) {
+      setReconcileError(err instanceof Error ? err.message : "Failed risk-node nudge");
+    } finally {
+      setIsNudgingGhost((prev) => ({ ...prev, [key]: false }));
+    }
+  };
+
+  const ghostInvoices = useMemo(() => {
+    const all = reconcileResult?.ghost_invoices || [];
+    let scoped = all;
+    if (selectedRiskNode?.id) {
+      const selected = String(selectedRiskNode.id).toUpperCase();
+      const filteredByNode = all.filter((item) => String(item?.gstin || "").toUpperCase() === selected);
+      scoped = filteredByNode.length > 0 ? filteredByNode : all;
+    }
+
+    let filtered = scoped;
+    if (radarRiskFilter !== "ALL") {
+      filtered = filtered.filter((item) => String(item?.risk_level || "LOW").toUpperCase() === radarRiskFilter);
+    }
+
+    const riskRank = { CRITICAL: 4, HIGH: 3, MEDIUM: 2, LOW: 1 };
+    const sorted = [...filtered].sort((a, b) => {
+      const taxA = Number(a?.tax_amount || 0);
+      const taxB = Number(b?.tax_amount || 0);
+      const confidenceA = Number(a?.fuzzy_match_confidence || 0);
+      const confidenceB = Number(b?.fuzzy_match_confidence || 0);
+      const riskA = riskRank[String(a?.risk_level || "LOW").toUpperCase()] || 1;
+      const riskB = riskRank[String(b?.risk_level || "LOW").toUpperCase()] || 1;
+
+      if (radarSortMode === "LEAK_DESC") {
+        return taxB - taxA;
+      }
+      if (radarSortMode === "CONFIDENCE_ASC") {
+        return confidenceA - confidenceB;
+      }
+      return riskB - riskA || taxB - taxA;
+    });
+
+    return sorted;
+  }, [reconcileResult, selectedRiskNode, radarRiskFilter, radarSortMode]);
+
+  const anomalySummary = useMemo(() => {
+    const fromBackend = reconcileResult?.anomaly_summary;
+    if (fromBackend) {
+      return fromBackend;
+    }
+
+    const all = reconcileResult?.ghost_invoices || [];
+    const risk_breakdown = { CRITICAL: 0, HIGH: 0, MEDIUM: 0, LOW: 0 };
+    let total = 0;
+    all.forEach((item) => {
+      const level = String(item?.risk_level || "LOW").toUpperCase();
+      if (risk_breakdown[level] !== undefined) {
+        risk_breakdown[level] += 1;
+      }
+      total += Number(item?.tax_amount || 0);
+    });
+
+    return {
+      detection_engine: "GSTR2B_RADAR",
+      total_potential_tax_leak: total,
+      risk_breakdown,
+      mismatch_rate_pct: all.length > 0 ? Math.round((all.length / Math.max(Number(reconcileResult?.ledger_records || 1), 1)) * 10000) / 100 : 0,
+      top_leak_vendors: [],
+    };
+  }, [reconcileResult]);
+
+  const inviteCaOnboard = async () => {
+    const email = caInviteEmail.trim().toLowerCase();
+    if (!email) {
+      setCaInviteError("Enter CA email to send invite.");
+      return;
+    }
+
+    setIsInvitingCa(true);
+    setCaInviteError("");
+    setCaInviteResult(null);
+    try {
+      const query = new URLSearchParams({ email }).toString();
+      const res = await fetch(`/api/v1/ca/invite?${query}`, {
+        method: "POST",
+        headers: {
+          "X-Role": "admin",
+          "X-Admin-Id": adminId,
+        },
+      });
+      const data = await res.json();
+      if (!res.ok) {
+        throw new Error(data?.detail || `CA invite failed (${res.status})`);
+      }
+      setCaInviteResult(data);
+      setWizardResult(`CA invite issued for ${data.email}. SMTP: ${data?.email_delivery?.status || "unknown"}.`);
+    } catch (err) {
+      setCaInviteError(err instanceof Error ? err.message : "Failed to send CA invite");
+    } finally {
+      setIsInvitingCa(false);
+    }
+  };
 
   const buildNudgeMessage = (vendor) => {
     const monthLabel = new Date().toLocaleString("en-IN", { month: "short", year: "numeric" });
@@ -278,6 +898,17 @@ export default function AiInsights() {
   useEffect(() => {
     void fetchSummary();
   }, [includeFiled, minMonthlyBalance]);
+
+  useEffect(() => {
+    void refreshModelHealth();
+    void fetchForensicAudit();
+    void fetchTelemetry();
+    void refreshNexusGraph();
+    const timer = setInterval(() => {
+      void fetchTelemetry();
+    }, 2000);
+    return () => clearInterval(timer);
+  }, [adminRole, adminId]);
 
   const runReversalWizard = async () => {
     if (!window.confirm("Generate Rule 37A reversal journals now?")) {
@@ -625,6 +1256,40 @@ export default function AiInsights() {
     }
   };
 
+  const uploadMobileSync = async (file) => {
+    if (!file) {
+      return;
+    }
+    setIsMobileSyncing(true);
+    setMobileSyncActive(true);
+    setReceiptError("");
+    setMobileSyncResult(null);
+    try {
+      const formData = new FormData();
+      formData.append("file", file);
+      const res = await fetch("/api/v1/ledger/mobile-sync", {
+        method: "POST",
+        headers: {
+          "X-Role": adminRole,
+          "X-Admin-Id": adminId,
+        },
+        body: formData,
+      });
+      const data = await res.json();
+      if (!res.ok) {
+        throw new Error(data?.error?.detail || data?.detail || `Unable to complete mobile sync (${res.status})`);
+      }
+      setMobileSyncResult(data);
+      setWizardResult(`Mobile sync posted as journal ${data.reference} (#${data.entry_id}).`);
+      await fetchSummary();
+    } catch (err) {
+      setReceiptError(err instanceof Error ? err.message : "Failed mobile sync");
+      setMobileSyncActive(false);
+    } finally {
+      setIsMobileSyncing(false);
+    }
+  };
+
   const exportTallyXml = async (entryId) => {
     if (!entryId) {
       return;
@@ -704,7 +1369,7 @@ export default function AiInsights() {
 
   if (loading) {
     return (
-      <div className="min-h-screen bg-slate-950 text-slate-200 flex items-center justify-center gap-3">
+      <div className="min-h-screen bg-black text-white flex items-center justify-center gap-3">
         <Loader2 className="w-5 h-5 animate-spin" />
         <span className="text-sm tracking-wide">Loading Accord Intelligence...</span>
       </div>
@@ -713,7 +1378,7 @@ export default function AiInsights() {
 
   if (error) {
     return (
-      <div className="min-h-screen bg-slate-950 text-slate-200 flex items-center justify-center p-6">
+      <div className="min-h-screen bg-black text-white flex items-center justify-center p-6">
         <div className="max-w-lg w-full rounded-2xl border border-red-500/40 bg-red-500/10 p-6">
           <p className="text-red-200 font-semibold">Failed to load insights</p>
           <p className="text-sm text-red-100/90 mt-1">{error}</p>
@@ -744,6 +1409,12 @@ export default function AiInsights() {
     const hardStopPenalty = critical ? 25 : 0;
     return Math.max(5, 100 - riskPenalty - pendingPenalty - hardStopPenalty);
   }, [summary, critical]);
+  const activeWorkers = isBatchUploading
+    ? 10
+    : isUploadingReceipt || isNeuralInking
+      ? 4
+      : Number(telemetry?.active_workers || 0);
+  const neuralEngineActive = Boolean(telemetry?.neural_engine_active) || isBatchUploading || isNeuralInking;
 
   const radarSignals = [
     {
@@ -766,8 +1437,57 @@ export default function AiInsights() {
     },
   ];
 
+  const investorKpis = useMemo(() => {
+    const totalRisk = Number(summary?.summary?.total_itc_at_risk ?? 0);
+    const potentialSavings = Number(summary?.summary?.total_potential_interest_savings ?? 0);
+    const vendorsFlagged = Number(summary?.summary?.vendors_flagged ?? topVendors.length ?? 0);
+    const forensicRisk = Number(forensicAudit?.risk_score ?? 0);
+    const cpuLoad = Number(telemetry?.cpu_percent ?? 0);
+    return {
+      totalRisk,
+      potentialSavings,
+      vendorsFlagged,
+      forensicRisk,
+      cpuLoad,
+      activeWorkers: Number(telemetry?.active_workers ?? 0),
+      cacheFreeMb: Number(telemetry?.cache_disk_free_mb ?? 0),
+    };
+  }, [summary, topVendors, forensicAudit, telemetry]);
+
+  const tallyClock = useMemo(() => {
+    const aiProcessedDocs =
+      Number(reversalEntries.length || 0) +
+      Number(batchUploadResults?.total_processed || 0) +
+      (receiptResult ? 1 : 0) +
+      (mobileSyncResult ? 1 : 0) +
+      (neuralInkResult ? 1 : 0);
+    const manualSecondsPerDoc = 180;
+    const aiSecondsPerDoc = 12;
+    const secondsSaved = Math.max(0, aiProcessedDocs * (manualSecondsPerDoc - aiSecondsPerDoc));
+    return {
+      docs: aiProcessedDocs,
+      secondsSaved,
+    };
+  }, [reversalEntries.length, batchUploadResults, receiptResult, mobileSyncResult, neuralInkResult]);
+
+  const pulsePoints = useMemo(() => {
+    if (m3PulseHistory.length === 0) {
+      return "";
+    }
+    const width = 560;
+    const height = 88;
+    return m3PulseHistory
+      .map((point, index) => {
+        const x = (index / Math.max(m3PulseHistory.length - 1, 1)) * width;
+        const load = Math.max(0, Math.min(100, (point.cpu * 0.8) + ((point.workers / 10) * 20)));
+        const y = height - (load / 100) * height;
+        return `${x},${y}`;
+      })
+      .join(" ");
+  }, [m3PulseHistory]);
+
   return (
-    <div className="ai-shell min-h-screen bg-slate-950 text-slate-100">
+    <div className="ai-shell min-h-screen bg-black text-white">
       <div className="mx-auto max-w-[96rem] px-4 sm:px-6 lg:px-8 py-8">
         <div className="grid grid-cols-1 xl:grid-cols-[320px_minmax(0,1fr)] gap-6">
           <aside className="ai-sidebar ai-reveal rounded-3xl border border-white/10 bg-white/5 backdrop-blur-xl p-4 sm:p-5 space-y-5 h-fit xl:sticky xl:top-6" data-delay="1">
@@ -809,6 +1529,34 @@ export default function AiInsights() {
               >
                 {isMintingBiometric ? "Minting..." : "Mint Biometric Token"}
               </button>
+            </div>
+
+            <div className="rounded-xl border border-slate-700/80 bg-slate-950/70 p-3 space-y-2">
+              <div className="flex items-center gap-2">
+                <UserPlus className="w-4 h-4 text-cyan-300" />
+                <p className="text-xs font-semibold text-slate-200">CA Network Onboarding</p>
+              </div>
+              <input
+                value={caInviteEmail}
+                onChange={(e) => setCaInviteEmail(e.target.value)}
+                placeholder="chartered.accountant@firm.in"
+                className="w-full rounded-lg border border-slate-700 bg-slate-950 px-3 py-2 text-xs"
+              />
+              <button
+                onClick={inviteCaOnboard}
+                disabled={isInvitingCa}
+                className="w-full inline-flex items-center justify-center gap-2 rounded-lg border border-cyan-700/70 bg-cyan-900/35 hover:bg-cyan-800/50 px-3 py-2 text-xs font-semibold disabled:opacity-60"
+              >
+                <Send className="w-3.5 h-3.5" />
+                {isInvitingCa ? "Sending Invite..." : "Send CA Invite"}
+              </button>
+              {caInviteError ? <p className="text-[11px] text-red-300">{caInviteError}</p> : null}
+              {caInviteResult ? (
+                <div className="rounded-lg border border-cyan-700/40 bg-slate-950/70 px-3 py-2 space-y-1">
+                  <p className="text-[11px] text-cyan-200 font-semibold">Invite: {caInviteResult.email}</p>
+                  <p className="text-[10px] text-slate-400">SMTP: {caInviteResult?.email_delivery?.status || "unknown"}</p>
+                </div>
+              ) : null}
             </div>
 
             <div className="rounded-xl border border-slate-700/80 bg-slate-950/70 p-3 space-y-2">
@@ -860,7 +1608,32 @@ export default function AiInsights() {
                 <Camera className="w-4 h-4 text-emerald-300" />
                 <p className="text-xs font-semibold text-emerald-100">Vision Ledger Scan</p>
               </div>
+              <div className="flex items-center justify-between rounded-lg border border-cyan-700/50 bg-black/40 px-2.5 py-2">
+                <p className="text-[11px] uppercase tracking-[0.16em] text-cyan-200">Mobile Capture Active</p>
+                <span
+                  className={`text-[11px] font-semibold ${
+                    mobileSyncActive || isMobileSyncing ? "text-emerald-300" : "text-slate-500"
+                  }`}
+                >
+                  {mobileSyncActive || isMobileSyncing ? "ACTIVE" : "IDLE"}
+                </span>
+              </div>
               <p className="text-[11px] text-slate-400">Capture or upload receipt image, auto-post journal, then export Tally XML.</p>
+              <label className="w-full inline-flex items-center justify-center gap-2 rounded-lg border border-cyan-600/70 bg-cyan-900/35 hover:bg-cyan-800/50 px-3 py-2 text-xs font-semibold cursor-pointer">
+                {isMobileSyncing ? "Syncing Mobile Capture..." : "Ghost-Ledger Mobile Sync"}
+                <input
+                  type="file"
+                  accept="image/*"
+                  capture="environment"
+                  disabled={isMobileSyncing}
+                  className="hidden"
+                  onChange={(event) => {
+                    const picked = event.target.files?.[0];
+                    void uploadMobileSync(picked);
+                    event.target.value = "";
+                  }}
+                />
+              </label>
               <label className="w-full inline-flex items-center justify-center gap-2 rounded-lg border border-emerald-700/70 bg-emerald-900/35 hover:bg-emerald-800/50 px-3 py-2 text-xs font-semibold cursor-pointer">
                 {isUploadingReceipt ? "Processing..." : "Scan Receipt"}
                 <input
@@ -886,6 +1659,21 @@ export default function AiInsights() {
                   className="hidden"
                   onChange={(event) => {
                     void uploadBatchReceipts(event.target.files);
+                    event.target.value = "";
+                  }}
+                />
+              </label>
+              <label className="w-full inline-flex items-center justify-center gap-2 rounded-lg border border-fuchsia-700/70 bg-fuchsia-900/35 hover:bg-fuchsia-800/50 px-3 py-2 text-xs font-semibold cursor-pointer">
+                {isNeuralInking ? "Running Neural-Ink..." : "Neural-Ink (Handwriting)"}
+                <input
+                  type="file"
+                  accept="image/*"
+                  capture="environment"
+                  disabled={isNeuralInking}
+                  className="hidden"
+                  onChange={(event) => {
+                    const picked = event.target.files?.[0];
+                    void uploadNeuralInk(picked);
                     event.target.value = "";
                   }}
                 />
@@ -931,8 +1719,34 @@ export default function AiInsights() {
                   </button>
                 </div>
               ) : null}
+              {mobileSyncResult ? (
+                <div className="rounded-lg border border-cyan-700/50 bg-slate-950/70 p-2 space-y-1">
+                  <p className="text-[11px] text-cyan-200 font-semibold">
+                    {mobileSyncResult.reference} | INR {mobileSyncResult.extracted?.total_amount}
+                  </p>
+                  <p className="text-[11px] text-slate-400 truncate">
+                    {mobileSyncResult.extracted?.vendor || "Vendor unknown"}
+                    {mobileSyncResult.extracted?.gstin ? ` | ${mobileSyncResult.extracted.gstin}` : ""}
+                  </p>
+                </div>
+              ) : null}
+              {neuralInkResult ? (
+                <div className="rounded-lg border border-fuchsia-700/50 bg-slate-950/70 p-2 space-y-1">
+                  <p className="text-[11px] text-fuchsia-200 font-semibold">
+                    {neuralInkResult.reference} | Fingerprint {String(neuralInkResult.entry_fingerprint || "").slice(0, 12)}...
+                  </p>
+                  <p className="text-[11px] text-slate-400 truncate">
+                    {neuralInkResult.extracted?.vendor || "Vendor unknown"}
+                    {neuralInkResult.extracted?.gstin ? ` | ${neuralInkResult.extracted.gstin}` : ""}
+                  </p>
+                  <p className="text-[10px] text-slate-500 truncate">
+                    {neuralInkResult.tally_export_file}
+                  </p>
+                </div>
+              ) : null}
               {receiptError ? <p className="text-[11px] text-red-300">{receiptError}</p> : null}
               {batchUploadError ? <p className="text-[11px] text-red-300">{batchUploadError}</p> : null}
+              {neuralInkError ? <p className="text-[11px] text-red-300">{neuralInkError}</p> : null}
             </div>
           </aside>
 
@@ -943,13 +1757,108 @@ export default function AiInsights() {
             <h1 className="text-2xl sm:text-3xl font-bold tracking-tight">Cash-Flow Protection Command Center</h1>
             <p className="text-sm text-slate-400 mt-1">As of {summary?.as_of_date}</p>
           </div>
-          <div className="rounded-xl border border-slate-800 bg-slate-900/70 px-4 py-3">
-            <p className="text-xs text-slate-400">Potential Interest Savings</p>
-            <p className="text-xl font-mono font-bold text-emerald-300">
-              {formatINR(summary?.summary?.total_potential_interest_savings)}
-            </p>
+          <div className="grid grid-cols-1 sm:grid-cols-4 gap-3 w-full sm:w-auto">
+            <div className="rounded-xl border border-white/15 bg-black/70 px-4 py-3 glass-panel">
+              <p className="text-xs text-slate-400">Potential Interest Savings</p>
+              <p className="text-xl font-mono font-bold text-emerald-300">
+                {formatINR(summary?.summary?.total_potential_interest_savings)}
+              </p>
+            </div>
+            <div className="rounded-xl bg-black/80 px-4 py-3" style={{ boxShadow: "inset 0 0 0 1px #0f172a" }}>
+              <p className="text-xs uppercase tracking-[0.16em] text-cyan-200">Tally-Clock</p>
+              <p className="text-xl font-mono font-bold text-white mt-1">{tallyClock.secondsSaved.toLocaleString("en-IN")}s</p>
+              <p className="text-[11px] text-slate-400 mt-1">{tallyClock.docs} docs auto-processed vs manual entry</p>
+            </div>
+            <button
+              onClick={() => setDeckMode((prev) => !prev)}
+              className="rounded-xl border border-cyan-500/40 bg-cyan-900/25 hover:bg-cyan-800/35 px-4 py-3 text-left"
+            >
+              <p className="text-xs text-cyan-200 uppercase tracking-[0.18em]">Investor Mode</p>
+              <p className="text-sm font-semibold mt-1">{deckMode ? "Deck Live" : "Launch Deck"}</p>
+              <p className="text-[11px] text-slate-300 mt-1">Client-ready narrative inside dashboard</p>
+            </button>
+            <M3CoreMonitor telemetry={telemetry} neuralActive={neuralEngineActive} mistralReady={mistralReady} />
           </div>
         </header>
+
+        {deckMode ? (
+          <section className="rounded-2xl border border-white/20 bg-black/70 p-5 space-y-5 glass-panel ai-panel ai-reveal" data-delay="2">
+            <div className="flex items-center justify-between gap-3">
+              <div>
+                <p className="text-xs tracking-[0.22em] uppercase text-cyan-300">Accord Sovereign OS Pitch</p>
+                <h2 className="text-xl font-bold mt-1">Investor Deck Components</h2>
+              </div>
+              <span className="text-xs text-slate-400 mono-metrics">BUILD: release/v1.0</span>
+            </div>
+
+            <div className="grid grid-cols-1 md:grid-cols-4 gap-3">
+              <div className="rounded-xl border border-slate-700 bg-slate-950/80 p-3">
+                <p className="text-[11px] text-slate-400">ITC at Risk Covered</p>
+                <p className="text-lg font-semibold text-white mt-1">{formatINR(investorKpis.totalRisk)}</p>
+              </div>
+              <div className="rounded-xl border border-slate-700 bg-slate-950/80 p-3">
+                <p className="text-[11px] text-slate-400">Interest Saved</p>
+                <p className="text-lg font-semibold text-emerald-300 mt-1">{formatINR(investorKpis.potentialSavings)}</p>
+              </div>
+              <div className="rounded-xl border border-slate-700 bg-slate-950/80 p-3">
+                <p className="text-[11px] text-slate-400">Worker Saturation</p>
+                <p className="text-lg font-semibold text-cyan-300 mt-1 mono-metrics">{investorKpis.activeWorkers}/10</p>
+              </div>
+              <div className="rounded-xl border border-slate-700 bg-slate-950/80 p-3">
+                <p className="text-[11px] text-slate-400">Forensic Risk Score</p>
+                <p className="text-lg font-semibold text-amber-300 mt-1 mono-metrics">{Math.round(investorKpis.forensicRisk)}</p>
+              </div>
+            </div>
+
+            <div className="grid grid-cols-1 lg:grid-cols-3 gap-4">
+              <div className="rounded-xl border border-slate-700 bg-slate-950/80 p-4">
+                <div className="flex items-center gap-2">
+                  <Layers className="w-4 h-4 text-cyan-300" />
+                  <p className="text-sm font-semibold">Technology Moat</p>
+                </div>
+                <p className="text-xs text-slate-400 mt-2">Llava + Llama3.2 + Mistral on-device with ledger fingerprinting and zero-float drift.</p>
+              </div>
+              <div className="rounded-xl border border-slate-700 bg-slate-950/80 p-4">
+                <div className="flex items-center gap-2">
+                  <Building2 className="w-4 h-4 text-emerald-300" />
+                  <p className="text-sm font-semibold">India Compliance Edge</p>
+                </div>
+                <p className="text-xs text-slate-400 mt-2">Rule 37A reversal shield + Section 50(3) Safe Harbor certificates + CA-grade audit trail.</p>
+              </div>
+              <div className="rounded-xl border border-slate-700 bg-slate-950/80 p-4">
+                <div className="flex items-center gap-2">
+                  <BarChart3 className="w-4 h-4 text-amber-300" />
+                  <p className="text-sm font-semibold">Hardware Throughput</p>
+                </div>
+                <p className="text-xs text-slate-400 mt-2">CPU {Math.round(investorKpis.cpuLoad)}% | Cache Free {investorKpis.cacheFreeMb} MB | 10-worker OCR pipeline.</p>
+              </div>
+            </div>
+
+            <div className="grid grid-cols-1 lg:grid-cols-3 gap-4">
+              <div className="rounded-xl border border-cyan-900/60 bg-black/75 p-4">
+                <div className="flex items-center gap-2">
+                  <Handshake className="w-4 h-4 text-cyan-300" />
+                  <p className="text-sm font-semibold">Next: CA Network</p>
+                </div>
+                <p className="text-xs text-slate-400 mt-2">Onboard first 10 CAs with Safe Harbor one-click certification and monthly compliance cockpit.</p>
+              </div>
+              <div className="rounded-xl border border-cyan-900/60 bg-black/75 p-4">
+                <div className="flex items-center gap-2">
+                  <Smartphone className="w-4 h-4 text-cyan-300" />
+                  <p className="text-sm font-semibold">Next: Mobile Ghost-Ledger</p>
+                </div>
+                <p className="text-xs text-slate-400 mt-2">Use iOS shell to ship camera-first Neural-Ink receipt capture with direct Tally bridge sync.</p>
+              </div>
+              <div className="rounded-xl border border-cyan-900/60 bg-black/75 p-4">
+                <div className="flex items-center gap-2">
+                  <FileSearch className="w-4 h-4 text-cyan-300" />
+                  <p className="text-sm font-semibold">Next: GSTR-2B Reconciler</p>
+                </div>
+                <p className="text-xs text-slate-400 mt-2">Automate missing invoice detection and trigger WhatsApp nudge workflow for vendor compliance.</p>
+              </div>
+            </div>
+          </section>
+        ) : null}
 
         <section className="grid grid-cols-1 xl:grid-cols-[320px_minmax(0,1fr)] gap-6 ai-panel ai-reveal" data-delay="2">
           <div className="rounded-2xl border border-cyan-500/25 bg-slate-900/50 p-5 flex flex-col items-center justify-center gap-3">
@@ -988,6 +1897,300 @@ export default function AiInsights() {
                   </div>
                 </motion.div>
               ))}
+            </div>
+          </div>
+        </section>
+
+        <section className="grid grid-cols-1 xl:grid-cols-2 gap-6 ai-panel ai-reveal" data-delay="2">
+          <div className="rounded-2xl border border-cyan-500/35 bg-black/75 p-5 space-y-4">
+            <div className="flex items-center justify-between gap-3">
+              <div>
+                <p className="text-xs tracking-[0.22em] uppercase text-cyan-300">Omni Ingest Command</p>
+                <h3 className="text-lg font-semibold mt-1">Drop Any Format</h3>
+              </div>
+              <Upload className="w-5 h-5 text-cyan-300" />
+            </div>
+
+            <label
+              className="block rounded-xl border border-dashed border-cyan-500/60 bg-slate-950/65 px-4 py-7 text-center cursor-pointer hover:bg-slate-900/70"
+              onDragOver={(event) => {
+                event.preventDefault();
+              }}
+              onDrop={(event) => {
+                event.preventDefault();
+                const dropped = event.dataTransfer.files;
+                void uploadOmniIngest(dropped);
+              }}
+            >
+              <p className="text-sm text-cyan-100 font-semibold">Omni-Drop Zone</p>
+              <p className="text-xs text-slate-400 mt-1">Excel, PDF, JPEG, PNG, video. Drop or click to ingest.</p>
+              <input
+                type="file"
+                accept=".xlsx,.xls,.csv,.pdf,.png,.jpg,.jpeg,.webp,.mp4,.mov,.avi,.mkv,.m4v"
+                multiple
+                className="hidden"
+                onChange={(event) => {
+                  const picked = event.target.files;
+                  void uploadOmniIngest(picked);
+                  event.target.value = "";
+                }}
+              />
+            </label>
+
+            <div className="rounded-lg border border-cyan-900/60 bg-slate-950/80 p-3">
+              <div className="flex items-center justify-between gap-3 mb-2">
+                <p className="text-[11px] text-cyan-200 uppercase tracking-[0.18em]">M3 Pulse</p>
+                <span className="text-[11px] text-slate-400">CPU {Math.round(Number(telemetry?.cpu_percent || 0))}%</span>
+              </div>
+              <svg viewBox="0 0 560 88" className="w-full h-20">
+                <rect x="0" y="0" width="560" height="88" fill="rgba(2,6,23,0.6)" />
+                {pulsePoints ? (
+                  <polyline
+                    points={pulsePoints}
+                    fill="none"
+                    stroke="#22d3ee"
+                    strokeWidth="2.5"
+                    strokeLinecap="round"
+                    strokeLinejoin="round"
+                  />
+                ) : null}
+              </svg>
+            </div>
+
+            {isOmniUploading ? (
+              <div className="space-y-2">
+                <p className="text-xs text-cyan-200">Ingesting with Omni-Reader... {omniUploadProgress}%</p>
+                <div className="h-2 rounded-full bg-slate-900/90 overflow-hidden border border-cyan-900/50">
+                  <motion.div
+                    className="h-full bg-cyan-300"
+                    animate={{ width: `${Math.max(2, omniUploadProgress)}%` }}
+                    transition={{ duration: 0.2, ease: "easeOut" }}
+                  />
+                </div>
+              </div>
+            ) : null}
+            {omniError ? <p className="text-xs text-red-300">{omniError}</p> : null}
+            {omniResult ? (
+              <div className="rounded-lg border border-emerald-700/45 bg-emerald-900/20 p-3 text-xs text-emerald-100 space-y-2">
+                <p>
+                  {omniResult.worker_model
+                    ? `Mode: ${omniResult.engine} | Posted: ${omniResult.posted_entries}/${omniResult.submitted}`
+                    : `Pipeline: ${omniResult.pipeline} | Entries: ${omniResult.entries_created}`}
+                </p>
+                {omniResult?.saturation_alert ? (
+                  <p className="text-amber-200">{omniResult.saturation_alert}</p>
+                ) : null}
+                {Number(omniResult?.failed_entries || 0) > 0 ? (
+                  <div className="space-y-1">
+                    <p className="text-red-200">Failed Files: {omniResult.failed_entries}</p>
+                    <button
+                      onClick={() => {
+                        void retryFailedOmniBatch();
+                      }}
+                      disabled={isRetryingOmniFailed}
+                      className="text-[11px] px-2.5 py-1 rounded border border-red-700/70 bg-red-900/30 hover:bg-red-800/45 text-red-100 disabled:opacity-60"
+                    >
+                      {isRetryingOmniFailed ? "Retrying..." : "Retry Failed"}
+                    </button>
+                  </div>
+                ) : null}
+              </div>
+            ) : null}
+
+            <div className="rounded-xl border border-indigo-700/55 bg-indigo-950/25 p-3 space-y-2">
+              <div className="flex items-center gap-2">
+                <Mic className="w-4 h-4 text-indigo-300" />
+                <p className="text-xs font-semibold text-indigo-100">Voice-to-Ledger</p>
+              </div>
+              <label className="w-full inline-flex items-center justify-center gap-2 rounded-lg border border-indigo-700/70 bg-indigo-900/35 hover:bg-indigo-800/45 px-3 py-2 text-xs font-semibold cursor-pointer">
+                {isVoiceUploading ? "Transcribing..." : "Upload Voice Command"}
+                <input
+                  type="file"
+                  accept="audio/*,.wav,.mp3,.m4a,.aac,.ogg"
+                  className="hidden"
+                  onChange={(event) => {
+                    const picked = event.target.files?.[0];
+                    void uploadVoiceCommand(picked);
+                    event.target.value = "";
+                  }}
+                />
+              </label>
+              {voiceError ? <p className="text-[11px] text-red-300">{voiceError}</p> : null}
+              {voiceResult ? (
+                <div className="rounded-lg border border-indigo-700/50 bg-slate-950/70 p-2 text-[11px] text-slate-300">
+                  <p className="text-indigo-200 font-semibold">{voiceResult.reference} | INR {voiceResult.parsed_voucher?.amount}</p>
+                  <p className="mt-1">{voiceResult.transcript}</p>
+                </div>
+              ) : null}
+            </div>
+          </div>
+
+          <div className="rounded-2xl border border-red-500/30 bg-black/75 p-5 space-y-4">
+            <div className="flex items-center justify-between gap-3">
+              <div>
+                <p className="text-xs tracking-[0.22em] uppercase text-red-300">GSTR-2B Anomaly Radar</p>
+                <h3 className="text-lg font-semibold mt-1">Ghost Invoice Detection</h3>
+              </div>
+              <Radar className="w-5 h-5 text-red-300" />
+            </div>
+
+            <label className="w-full inline-flex items-center justify-center gap-2 rounded-lg border border-red-700/65 bg-red-900/25 hover:bg-red-800/30 px-3 py-2 text-xs font-semibold cursor-pointer">
+              {isReconciling2b ? "Reconciling..." : "Upload 2B JSON/Excel"}
+              <input
+                type="file"
+                accept=".json,.xlsx,.xls,.csv"
+                className="hidden"
+                onChange={(event) => {
+                  const picked = event.target.files?.[0];
+                  void upload2bReconciliation(picked);
+                  event.target.value = "";
+                }}
+              />
+            </label>
+
+            {reconcileError ? <p className="text-xs text-red-300">{reconcileError}</p> : null}
+            {reconcileResult ? (
+              <div className="rounded-lg border border-red-700/45 bg-red-950/25 p-3 space-y-2">
+                <p className="text-xs text-red-100 font-semibold">
+                  Ghost Invoices: {reconcileResult.ghost_invoices_count} | Ledger Rows: {reconcileResult.ledger_records}
+                </p>
+                <div className="grid grid-cols-2 lg:grid-cols-4 gap-2">
+                  <div className="rounded border border-red-800/50 bg-black/40 px-2.5 py-2">
+                    <p className="text-[10px] text-slate-400 uppercase tracking-[0.12em]">Potential Tax Leak</p>
+                    <p className="text-sm font-semibold text-red-200">{formatINR(anomalySummary?.total_potential_tax_leak || 0)}</p>
+                  </div>
+                  <div className="rounded border border-red-800/50 bg-black/40 px-2.5 py-2">
+                    <p className="text-[10px] text-slate-400 uppercase tracking-[0.12em]">Critical</p>
+                    <p className="text-sm font-semibold text-red-300">{anomalySummary?.risk_breakdown?.CRITICAL || 0}</p>
+                  </div>
+                  <div className="rounded border border-red-800/50 bg-black/40 px-2.5 py-2">
+                    <p className="text-[10px] text-slate-400 uppercase tracking-[0.12em]">High</p>
+                    <p className="text-sm font-semibold text-amber-300">{anomalySummary?.risk_breakdown?.HIGH || 0}</p>
+                  </div>
+                  <div className="rounded border border-red-800/50 bg-black/40 px-2.5 py-2">
+                    <p className="text-[10px] text-slate-400 uppercase tracking-[0.12em]">Mismatch Rate</p>
+                    <p className="text-sm font-semibold text-cyan-200">{Number(anomalySummary?.mismatch_rate_pct || 0).toFixed(2)}%</p>
+                  </div>
+                </div>
+
+                <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
+                  <select
+                    value={radarRiskFilter}
+                    onChange={(event) => setRadarRiskFilter(event.target.value)}
+                    className="rounded border border-red-800/60 bg-slate-950 px-2.5 py-1.5 text-xs text-red-100"
+                  >
+                    <option value="ALL">Filter: All Risk Levels</option>
+                    <option value="CRITICAL">Filter: Critical</option>
+                    <option value="HIGH">Filter: High</option>
+                    <option value="MEDIUM">Filter: Medium</option>
+                    <option value="LOW">Filter: Low</option>
+                  </select>
+                  <select
+                    value={radarSortMode}
+                    onChange={(event) => setRadarSortMode(event.target.value)}
+                    className="rounded border border-red-800/60 bg-slate-950 px-2.5 py-1.5 text-xs text-red-100"
+                  >
+                    <option value="RISK_DESC">Sort: Risk (High to Low)</option>
+                    <option value="LEAK_DESC">Sort: Leak Amount (High to Low)</option>
+                    <option value="CONFIDENCE_ASC">Sort: Confidence (Low to High)</option>
+                  </select>
+                </div>
+
+                {selectedRiskNode?.id ? (
+                  <p className="text-[11px] text-cyan-200">Radar focus: {selectedRiskNode.id}</p>
+                ) : null}
+                <div className="space-y-2 max-h-48 overflow-y-auto">
+                  {ghostInvoices.slice(0, 12).map((item) => (
+                    <div key={`ghost-${item.entry_id}`} className="rounded-lg border border-red-800/50 bg-slate-950/70 px-3 py-2">
+                      <p className="text-[11px] text-red-200 font-semibold">
+                        {item.reference} | {item.gstin}
+                        <span className="ml-2 text-[10px] text-amber-300">{String(item.risk_level || "LOW").toUpperCase()}</span>
+                      </p>
+                      <p className="text-[11px] text-slate-400">{item.vendor_name} | Potential Leak {formatINR(item.tax_amount)}</p>
+                      <p className="text-[10px] text-slate-500">
+                        Confidence: {Math.round(Number(item.fuzzy_match_confidence || 0) * 100)}% | Action: {item.recommended_action || "MONITOR"}
+                      </p>
+                      <div className="mt-1">
+                        <span
+                          className={`text-[10px] px-2 py-0.5 rounded border ${
+                            String(item.nudge_status || "PENDING").toUpperCase() === "SENT"
+                              ? "text-emerald-200 border-emerald-600/70 bg-emerald-900/30"
+                              : String(item.nudge_status || "PENDING").toUpperCase() === "FAILED"
+                                ? "text-red-200 border-red-600/70 bg-red-900/30"
+                                : "text-amber-200 border-amber-600/70 bg-amber-900/30"
+                          }`}
+                        >
+                          [{String(item.nudge_status || "PENDING").toUpperCase()}]
+                        </span>
+                      </div>
+                      <div className="mt-1 flex items-center justify-between gap-3">
+                        <span className="text-[10px] text-slate-500 truncate">{item.nudge_template?.message || "No nudge generated"}</span>
+                        <button
+                          onClick={() => {
+                            void sendGhostNudge(item);
+                          }}
+                          disabled={Boolean(isNudgingGhost[`${item.entry_id}`])}
+                          className="text-[10px] px-2 py-1 rounded border border-cyan-700/70 bg-cyan-900/35 hover:bg-cyan-800/50 text-cyan-100 disabled:opacity-60"
+                        >
+                          {isNudgingGhost[`${item.entry_id}`]
+                            ? "Generating..."
+                            : String(item.nudge_status || "PENDING").toUpperCase() === "FAILED"
+                              ? "Retry Nudge"
+                              : "WhatsApp Nudge"}
+                        </button>
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              </div>
+            ) : null}
+
+            <div className="flex items-center justify-between">
+              <p className="text-xs text-slate-400">Nexus Graph Intelligence</p>
+              <button
+                onClick={refreshNexusGraph}
+                className="text-[11px] px-2.5 py-1 rounded border border-slate-700 bg-slate-900 hover:bg-slate-800 text-slate-200"
+              >
+                Refresh Graph
+              </button>
+            </div>
+            <NexusGraph
+              graph={nexusGraphData}
+              onRiskNodeSelect={(node) => {
+                setSelectedRiskNode(node);
+              }}
+            />
+
+            <div className="rounded-xl border border-cyan-700/45 bg-cyan-900/15 px-3 py-3">
+              <p className="text-xs uppercase tracking-[0.16em] text-cyan-200">Auto Nudge From Nexus Node</p>
+              {selectedRiskNode ? (
+                <div className="mt-2 space-y-2">
+                  <p className="text-xs text-slate-300">
+                    Selected Node: <span className="text-cyan-100 font-semibold">{selectedRiskNode.id}</span>
+                    {selectedRiskNode.urgency ? <span className="ml-2 text-amber-300">Urgency: {selectedRiskNode.urgency}</span> : null}
+                  </p>
+                  <input
+                    value={riskNudgePhone}
+                    onChange={(event) => setRiskNudgePhone(event.target.value)}
+                    placeholder="Vendor WhatsApp number (+91...) optional"
+                    className="w-full rounded border border-slate-700 bg-slate-950 px-2.5 py-1.5 text-xs text-slate-100"
+                  />
+                  <button
+                    onClick={() => {
+                      void sendRiskNodeNudge();
+                    }}
+                    disabled={Boolean(isNudgingGhost[`risk-${String(selectedRiskNode.id).toUpperCase()}`])}
+                    className="text-xs px-3 py-1.5 rounded border border-cyan-600/70 bg-cyan-900/35 hover:bg-cyan-800/45 text-cyan-100 disabled:opacity-60"
+                  >
+                    {isNudgingGhost[`risk-${String(selectedRiskNode.id).toUpperCase()}`] ? "Generating..." : "Generate Node Nudge"}
+                  </button>
+                  {selectedRiskNode.last_message ? (
+                    <p className="text-[11px] text-slate-400 truncate">{selectedRiskNode.last_message}</p>
+                  ) : null}
+                </div>
+              ) : (
+                <p className="mt-2 text-xs text-slate-400">Click a red node in Nexus graph to activate targeted nudge generation.</p>
+              )}
             </div>
           </div>
         </section>
@@ -1148,54 +2351,96 @@ export default function AiInsights() {
             {reversalEntries.length === 0 ? (
               <p className="text-sm text-slate-400">No reversal batches found for this view.</p>
             ) : (
-              reversalEntries.map((entry) => (
-                <div
-                  key={entry.entry_id}
-                  className={`rounded-xl border px-4 py-3 flex flex-col gap-2 md:flex-row md:items-center md:justify-between ${
-                    entry.is_filed
-                      ? "border-slate-700 bg-slate-950/40 opacity-60 grayscale"
-                      : "border-slate-800 bg-slate-950/80"
-                  }`}
-                >
-                  <div className="space-y-2">
-                    <p className="font-medium">{entry.reference}</p>
-                    <p className="text-xs text-slate-500">Created: {formatDateTime(entry.reversal_created_at)}</p>
-                    <p className="text-xs text-slate-500">Amount: {formatINR(entry.reversal_amount)}</p>
-                    <div className="rounded-lg border border-slate-800 bg-slate-950/70 px-3 py-2">
-                      <p className="text-[11px] text-slate-400 mb-1">Chain of Control</p>
-                      <p className="text-[11px] text-slate-300">
-                        Created: {entry.approval_timeline?.created_by ? `Admin-${entry.approval_timeline.created_by}` : "-"} @ {formatDateTime(entry.approval_timeline?.timestamps?.created_at)}
-                      </p>
-                      <p className="text-[11px] text-slate-300">
-                        Exported: {entry.approval_timeline?.exported_by ? `Admin-${entry.approval_timeline.exported_by}` : "-"} @ {formatDateTime(entry.approval_timeline?.timestamps?.exported_at)}
-                      </p>
-                      <p className="text-[11px] text-slate-300">
-                        Verified: {entry.approval_timeline?.verified_by ? `Admin-${entry.approval_timeline.verified_by}` : "-"} @ {formatDateTime(entry.approval_timeline?.timestamps?.verified_at)}
-                      </p>
-                      <p className="text-[11px] text-slate-300">
-                        2nd Approval: {entry.approval_timeline?.approved_by_2 ? `Admin-${entry.approval_timeline.approved_by_2}` : "-"} @ {formatDateTime(entry.approval_timeline?.timestamps?.approved_at)}
-                      </p>
+              <AnimatePresence initial={false}>
+                {reversalEntries.map((entry) => (
+                  <motion.div
+                    key={entry.entry_id}
+                    layout
+                    initial={{ opacity: 0, x: 28 }}
+                    animate={{ opacity: 1, x: 0 }}
+                    exit={{ opacity: 0, x: -18 }}
+                    transition={{ duration: 0.28, ease: "easeOut" }}
+                    className={`rounded-xl border px-4 py-3 flex flex-col gap-2 md:flex-row md:items-center md:justify-between ${
+                      entry.is_filed
+                        ? "border-slate-700 bg-slate-950/40 opacity-60 grayscale"
+                        : "border-slate-800 bg-slate-950/80"
+                    }`}
+                  >
+                    <div className="space-y-2">
+                      <p className="font-medium">{entry.reference}</p>
+                      <p className="text-xs text-slate-500">Created: {formatDateTime(entry.reversal_created_at)}</p>
+                      <p className="text-xs text-slate-500">Amount: {formatINR(entry.reversal_amount)}</p>
+                      <div className="rounded-lg border border-slate-800 bg-slate-950/70 px-3 py-2">
+                        <p className="text-[11px] text-slate-400 mb-1">Chain of Control</p>
+                        <p className="text-[11px] text-slate-300">
+                          Created: {entry.approval_timeline?.created_by ? `Admin-${entry.approval_timeline.created_by}` : "-"} @ {formatDateTime(entry.approval_timeline?.timestamps?.created_at)}
+                        </p>
+                        <p className="text-[11px] text-slate-300">
+                          Exported: {entry.approval_timeline?.exported_by ? `Admin-${entry.approval_timeline.exported_by}` : "-"} @ {formatDateTime(entry.approval_timeline?.timestamps?.exported_at)}
+                        </p>
+                        <p className="text-[11px] text-slate-300">
+                          Verified: {entry.approval_timeline?.verified_by ? `Admin-${entry.approval_timeline.verified_by}` : "-"} @ {formatDateTime(entry.approval_timeline?.timestamps?.verified_at)}
+                        </p>
+                        <p className="text-[11px] text-slate-300">
+                          2nd Approval: {entry.approval_timeline?.approved_by_2 ? `Admin-${entry.approval_timeline.approved_by_2}` : "-"} @ {formatDateTime(entry.approval_timeline?.timestamps?.approved_at)}
+                        </p>
+                      </div>
                     </div>
-                  </div>
-                  <div className="text-right">
-                    <span
-                      className={`inline-flex items-center rounded-full border px-2.5 py-1 text-[11px] font-semibold ${
-                        entry.is_filed
-                          ? "border-emerald-500/40 bg-emerald-500/15 text-emerald-200"
-                          : "border-amber-500/40 bg-amber-500/15 text-amber-200"
-                      }`}
-                    >
-                      {entry.is_filed ? "FILED" : "PENDING_REVIEW"}
-                    </span>
-                    {entry.waiting_second_admin ? (
-                      <p className="text-[11px] text-amber-300 mt-1">Waiting for 2nd Admin</p>
-                    ) : null}
-                    {entry.filed_at ? <p className="text-xs text-slate-500 mt-1">Filed: {formatDateTime(entry.filed_at)}</p> : null}
-                  </div>
-                </div>
-              ))
+                    <div className="text-right">
+                      <span
+                        className={`inline-flex items-center rounded-full border px-2.5 py-1 text-[11px] font-semibold ${
+                          entry.is_filed
+                            ? "border-emerald-500/40 bg-emerald-500/15 text-emerald-200"
+                            : "border-amber-500/40 bg-amber-500/15 text-amber-200"
+                        }`}
+                      >
+                        {entry.is_filed ? "FILED" : "PENDING_REVIEW"}
+                      </span>
+                      {entry.waiting_second_admin ? (
+                        <p className="text-[11px] text-amber-300 mt-1">Waiting for 2nd Admin</p>
+                      ) : null}
+                      {entry.filed_at ? <p className="text-xs text-slate-500 mt-1">Filed: {formatDateTime(entry.filed_at)}</p> : null}
+                    </div>
+                  </motion.div>
+                ))}
+              </AnimatePresence>
             )}
           </div>
+        </section>
+
+        <section className="rounded-2xl border border-white/20 bg-black/65 p-5 space-y-3 glass-panel ai-panel ai-reveal" data-delay="3">
+          <div className="flex items-center justify-between gap-3">
+            <h3 className="text-lg font-semibold">Forensic Audit Dashboard</h3>
+            <button
+              onClick={fetchForensicAudit}
+              disabled={isForensicLoading}
+              className="inline-flex items-center justify-center gap-2 px-4 py-2 rounded-lg border border-cyan-700/70 bg-cyan-900/40 hover:bg-cyan-800/50 text-sm font-semibold disabled:opacity-60"
+            >
+              {isForensicLoading ? "Scanning..." : "Audit Trigger"}
+            </button>
+          </div>
+          {forensicError ? <p className="text-sm text-red-300">{forensicError}</p> : null}
+          {forensicAudit ? (
+            <div className="space-y-2">
+              <p className="text-sm text-slate-300">
+                Model: <span className="text-cyan-300 mono-metrics">{forensicAudit.model}</span> | Risk Score: <span className="text-amber-300 mono-metrics">{forensicAudit.risk_score}</span>
+              </p>
+              <p className="text-xs text-slate-400">Fingerprint: <span className="mono-metrics text-emerald-300">{forensicAudit.report_fingerprint}</span></p>
+              <pre className="rounded-xl border border-cyan-900/60 bg-black/85 p-3 text-[11px] leading-relaxed text-slate-100 font-mono max-h-56 overflow-auto">
+{forensicError ? `ERROR> ${forensicError}` : forensicStreamText || "READY> Awaiting forensic trigger..."}
+              </pre>
+              <div className="space-y-2 max-h-44 overflow-y-auto">
+                {(forensicAudit.flagged_entries || []).slice(0, 8).map((item, idx) => (
+                  <div key={`forensic-${item.entry_id || idx}`} className="rounded-lg border border-slate-700 bg-slate-950/70 px-3 py-2">
+                    <p className="text-xs text-amber-200">Entry #{item.entry_id || "-"} | {item.severity || "MEDIUM"}</p>
+                    <p className="text-[11px] text-slate-300">{item.issue || "No issue details provided."}</p>
+                  </div>
+                ))}
+              </div>
+            </div>
+          ) : (
+            <p className="text-sm text-slate-400">No forensic snapshot yet. Run refresh to scan the latest ledger entries.</p>
+          )}
         </section>
 
         <section className="rounded-2xl border border-slate-800 bg-slate-900/60 p-5 space-y-3 ai-panel ai-reveal" data-delay="3">

@@ -41,7 +41,23 @@ const trustSignals = [
   "Local Friday AI on-device for privacy-first analysis",
 ];
 
-export default function LandingPage() {
+export default function LandingPage({ language = "en", simpleMode = false }) {
+  const isHindi = language === "hi";
+  const eyebrow = isHindi ? "गवर्नेंस-फर्स्ट ईआरपी" : "Governance-First ERP";
+  const heroTitle = isHindi
+    ? "भारतीय SME के लिए ऑडिट सुरक्षा"
+    : "Audit Immunity for Indian SMEs.";
+  const heroSubtitle = isHindi
+    ? "अनुपालन को प्रतिस्पर्धी बढ़त में बदलें"
+    : "Compliance that compounds into advantage.";
+  const bodyText = simpleMode
+    ? isHindi
+      ? "अकॉर्ड आपके व्यवसाय को GST, CA अनुमोदन और रिपोर्टिंग में सरल मदद देता है। आसान भाषा, साफ स्क्रीन, और सुरक्षित डेटा।"
+      : "Accord helps your business with GST, CA approvals, and reporting in a simple flow. Clear screens, easy language, secure data."
+    : isHindi
+      ? "अकॉर्ड Rule 37A जटिलता को स्पष्ट संचालन में बदलता है, स्थानीय AI विश्लेषण और ऑडिट-रेडी प्रमाण के साथ।"
+      : "Accord turns Rule 37A chaos into operational clarity with CA-ready governance, local AI reasoning, and export proofs built for scrutiny.";
+
   return (
     <div className="min-h-screen text-slate-100 bg-[#020617]">
       <section className="relative overflow-hidden px-4 sm:px-6 lg:px-8 pt-14 pb-20">
@@ -60,7 +76,7 @@ export default function LandingPage() {
             animate={{ opacity: 1, y: 0 }}
             className="text-[11px] uppercase tracking-[0.24em] text-cyan-300/90 font-semibold"
           >
-            Governance-First ERP
+            {eyebrow}
           </motion.p>
 
           <motion.h1
@@ -70,8 +86,8 @@ export default function LandingPage() {
             className="mt-4 max-w-4xl text-4xl sm:text-5xl lg:text-6xl font-black leading-tight tracking-tight"
             style={{ fontFamily: '"Sora", "Space Grotesk", sans-serif' }}
           >
-            Audit Immunity for Indian SMEs.
-            <span className="block text-cyan-300">Compliance that compounds into advantage.</span>
+            {heroTitle}
+            <span className="block text-cyan-300">{heroSubtitle}</span>
           </motion.h1>
 
           <motion.p
@@ -80,8 +96,7 @@ export default function LandingPage() {
             transition={{ delay: 0.16 }}
             className="mt-6 max-w-2xl text-base sm:text-lg text-slate-300/90"
           >
-            Accord turns Rule 37A chaos into operational clarity with CA-ready governance, local AI reasoning,
-            and export proofs built for scrutiny.
+            {bodyText}
           </motion.p>
 
           <motion.div
@@ -94,14 +109,14 @@ export default function LandingPage() {
               to="/insights"
               className="inline-flex items-center gap-2 rounded-xl bg-cyan-500 hover:bg-cyan-400 text-slate-950 px-5 py-3 text-sm font-bold"
             >
-              Start Free Compliance Scan
+              {isHindi ? "मुफ्त अनुपालन स्कैन शुरू करें" : "Start Free Compliance Scan"}
               <ScanLine className="w-4 h-4" />
             </Link>
             <Link
               to="/pricing"
               className="inline-flex items-center gap-2 rounded-xl border border-cyan-400/50 bg-slate-950/50 hover:bg-slate-900/70 px-5 py-3 text-sm font-semibold"
             >
-              View Pricing
+              {isHindi ? "मूल्य देखें" : "View Pricing"}
               <ArrowRight className="w-4 h-4" />
             </Link>
           </motion.div>

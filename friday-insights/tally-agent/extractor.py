@@ -287,57 +287,45 @@ def parse_outstanding_xml(xml_text: str) -> List[Dict[str, Any]]:
     return rows
 
 
+def parse_stock_xml(xml_text: str) -> List[Dict[str, Any]]:
+    root = ET.fromstring(xml_text)
+    items: List[Dict[str, Any]] = []
+
+    for elem in root.iter():
+        tag = normalize_tag(elem.tag)
+        if tag not in ("stockitem", "stockgroupsummary", "stocksummary", "stockentry"):
+            continue
+
+        tag_map = collect_tag_texts(elem)
+        name = (elem.get("NAME") or elem.get("name", "")).strip()
+        if not name:
+            name = find_first_text(tag_map, ["name", "stockitemname", "itemname"])
+
+        qty_text = find_first_text(
+            tag_map,
+            ["closingbalance", "closingstock", "closingbaseunits", "closingqty", "quantity", "qty"],
+        )
+        value_text = find_first_text(
+            tag_map,
+            ["closingvalue", "closingbalancevalue", "closingstockvalue", "value", "amount"],
+        )
+
+        qty = parse_decimal(qty_text) if qty_text else Decimal("0")
+        value = parse_decimal(value_text) if value_text else Decimal("0")
+
+        if name or (qty is not None and qty != Decimal("0")):
+            items.append(
+                {
+                    "item_name": name,
+                    "closing_qty": str(qty or Decimal("0")),
+                    "closing_value": str(value or Decimal("0")),
+                }
+            )
+
+    return items
+
+
 def init_db(conn: sqlite3.Connection) -> None:
-            if any([party, bill_no, due_date]) or pending != Decimal("0"):
-                rows.append(
-                    {
-                        "party": party,
-                        "bill_no": bill_no,
-                        "due_date": due_date,
-                        "pending_amount": str(pending),
-                    }
-                )
-
-        return rows
-
-
-    def parse_stock_xml(xml_text: str) -> List[Dict[str, Any]]:
-        root = ET.fromstring(xml_text)
-        items: List[Dict[str, Any]] = []
-
-        for elem in root.iter():
-            tag = normalize_tag(elem.tag)
-            if tag not in ("stockitem", "stockgroupsummary", "stocksummary", "stockentry"):
-                continue
-
-            tag_map = collect_tag_texts(elem)
-            name = (elem.get("NAME") or elem.get("name", "")).strip()
-            if not name:
-                name = find_first_text(tag_map, ["name", "stockitemname", "itemname"])
-
-            qty_text = find_first_text(tag_map, [
-                "closingbalance", "closingstock", "closingbaseunits", "closingqty", "quantity", "qty",
-            ])
-            value_text = find_first_text(tag_map, [
-                "closingvalue", "closingbalancevalue", "closingstockvalue", "value", "amount",
-            ])
-
-            qty = parse_decimal(qty_text) if qty_text else Decimal("0")
-            value = parse_decimal(value_text) if value_text else Decimal("0")
-
-            if name or (qty is not None and qty != Decimal("0")):
-                items.append(
-                    {
-                        "item_name": name,
-                        "closing_qty": str(qty or Decimal("0")),
-                        "closing_value": str(value or Decimal("0")),
-                    }
-                )
-
-        return items
-
-
-    def init_db(conn: sqlite3.Connection) -> None:
     conn.execute(
         """
         CREATE TABLE IF NOT EXISTS outbox (
@@ -503,6 +491,13 @@ def extract(report_date_yyyymmdd: str, tally_url: str = TALLY_URL) -> ExtractRes
 
         daybook = parse_daybook_xml(daybook_xml)
         outstanding = parse_outstanding_xml(outstanding_xml)
+        # Inventory fetch is non-fatal: service businesses may not maintain stock in Tally.
+        try:
+            stock_xml = post_xml(tally_url, build_stock_summary_xml(report_date_yyyymmdd))
+            inventory = parse_stock_xml(stock_xml)
+        except (HTTPError, URLError, TimeoutError, ET.ParseError):
+            inventory = []
+
         validation = dual_algorithm_validate(daybook)
 
         payload = {
@@ -511,31 +506,8 @@ def extract(report_date_yyyymmdd: str, tally_url: str = TALLY_URL) -> ExtractRes
             "report_date": report_date_yyyymmdd,
             "daybook": daybook,
             "outstanding_receivables": outstanding,
+            "inventory_summary": inventory,
             "validation": validation,
-                try:
-                    daybook_xml = post_xml(tally_url, build_daybook_xml(report_date_yyyymmdd))
-                    outstanding_xml = post_xml(tally_url, build_outstanding_xml(report_date_yyyymmdd))
-
-                    daybook = parse_daybook_xml(daybook_xml)
-                    outstanding = parse_outstanding_xml(outstanding_xml)
-
-                    # Inventory is non-fatal: SMEs without stock items configured shouldn't block the cash-flow extraction.
-                    try:
-                        stock_xml = post_xml(tally_url, build_stock_summary_xml(report_date_yyyymmdd))
-                        inventory = parse_stock_xml(stock_xml)
-                    except (HTTPError, URLError, TimeoutError, ET.ParseError):
-                        inventory = []
-
-                    validation = dual_algorithm_validate(daybook)
-
-                    payload = {
-                        "schema_version": "2.0",
-                        "extracted_at_utc": utc_now_iso(),
-                        "report_date": report_date_yyyymmdd,
-                        "daybook": daybook,
-                        "outstanding_receivables": outstanding,
-                        "inventory_summary": inventory,
-                        "validation": validation,
             "meta": {
                 "source": "tally_prime_xml_port_9000",
                 "host": "localhost",

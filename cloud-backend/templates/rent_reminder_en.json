@@ -1,0 +1,4 @@
+{
+  "template_id": "rent_reminder_en",
+  "message": "Dear tenant {tenant_id}, your rent of INR {amount_due} is due on {due_date}. Please pay on time to avoid penalties."
+}

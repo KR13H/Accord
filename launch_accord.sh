@@ -29,7 +29,12 @@ if ! command -v ollama >/dev/null 2>&1; then
 fi
 
 echo "[Accord] Ensuring Ollama model is available (llama3.2)..."
-ollama pull llama3.2 >/dev/null
+if ! ollama list 2>/dev/null | awk '{print $1}' | grep -Eq '^llama3\.2(:|$)'; then
+  echo "[Accord] llama3.2 not found locally. Pulling model..."
+  ollama pull llama3.2 >/dev/null
+else
+  echo "[Accord] llama3.2 already present."
+fi
 
 if ! curl -fsS "http://localhost:11434/api/tags" >/dev/null 2>&1; then
   echo "[Accord] Starting Ollama service in background..."
@@ -39,9 +44,27 @@ fi
 
 echo "[Accord] Launching Docker stack (Postgres + Backend + Frontend)..."
 if docker info >/dev/null 2>&1; then
-  docker compose up --build -d
-  FRONTEND_URL="http://localhost:3000"
-  BACKEND_URL="http://localhost:8000"
+  if [[ "${ACCORD_USE_PROD_COMPOSE:-0}" == "1" ]]; then
+    PROD_ENV_FILE="${ACCORD_PROD_ENV_FILE:-$ROOT_DIR/.env.production}"
+    if [[ ! -f "$PROD_ENV_FILE" ]]; then
+      echo "[Accord] ERROR: ACCORD_USE_PROD_COMPOSE=1 but env file not found: $PROD_ENV_FILE"
+      echo "[Accord] Copy .env.production.example to .env.production and set required secrets."
+      exit 1
+    fi
+    echo "[Accord] Using production compose stack with Redis realtime bus..."
+    docker compose --env-file "$PROD_ENV_FILE" -f "$ROOT_DIR/docker-compose.prod.yml" up --build -d
+    FRONTEND_URL="http://localhost:3000"
+    BACKEND_URL="http://localhost:8000"
+  elif [[ "${FORCE_BUILD:-0}" == "1" ]]; then
+    echo "[Accord] FORCE_BUILD=1 set. Rebuilding images..."
+    docker compose up --build -d
+    FRONTEND_URL="http://localhost:3000"
+    BACKEND_URL="http://localhost:8000"
+  else
+    docker compose up -d
+    FRONTEND_URL="http://localhost:3000"
+    BACKEND_URL="http://localhost:8000"
+  fi
 else
   echo "[Accord] Docker daemon unavailable. Falling back to local runtime..."
   (

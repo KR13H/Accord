@@ -9,3 +9,15 @@ psycopg[binary]
 pytesseract
 Pillow
 opencv-python
+pandas
+openpyxl
+pymupdf
+openai-whisper
+pydub
+networkx
+twilio
+redis
+celery
+thefuzz
+python-Levenshtein
+polars

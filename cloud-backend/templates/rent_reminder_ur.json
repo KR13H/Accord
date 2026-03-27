@@ -1,0 +1,4 @@
+{
+  "template_id": "rent_reminder_ur",
+  "message": "محترم کرایہ دار {tenant_id}، آپ کا کرایہ INR {amount_due} بتاريخ {due_date} واجب الادا ہے۔ براہ کرم جرمانے سے بچنے کے لئے وقت پر ادائیگی کریں۔"
+}

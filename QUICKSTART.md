@@ -11,6 +11,27 @@ All dependencies automatically configured:
 
 ---
 
+## 0️⃣ Intelligence Phase (Japneet)
+
+Execution directive is now documented at [INTELLIGENCE-PHASE-JAPNEET.md](INTELLIGENCE-PHASE-JAPNEET.md).
+
+Immediate deliverables:
+- IMS regulatory gap report (Accept/Reject/Pending workflows in competitor products)
+- Sharma Logistics precision audit (batch inventory + Decimal(12,4) edge cases)
+- Tally Prime 4.0 handshake report (voucher XML + attachment compatibility)
+- Hyper-local GTM cluster report (top 3 high-friction clusters with pilot plan)
+
+Delivery SLA:
+- First draft: T+48 hours
+- Final: T+72 hours
+
+Storage path:
+```bash
+mkdir -p research/intelligence
+```
+
+---
+
 ## 1️⃣ Start Backend Server
 
 ```bash
@@ -28,6 +49,65 @@ uvicorn main:app --host 0.0.0.0 --port 8000
 ```
 
 **Verify**: Visit `http://localhost:8000/docs` → You should see OpenAPI swagger interface
+
+---
+
+## 1.5️⃣ Production-Like Docker Stack (Submission Ready)
+
+Run this path when validating App Store/Play Store submission behavior against Redis-backed realtime sync.
+
+```bash
+cd /Users/krish/Developer/Accord
+
+# One-time setup
+cp .env.production.example .env.production
+
+# Edit .env.production and set real secrets/domains first
+
+# Deploy stack
+chmod +x scripts/deploy_docker_prod.sh
+./scripts/deploy_docker_prod.sh .env.production
+
+# Optional: run full readiness audit (DB -> Redis -> SSE stream)
+chmod +x scripts/readiness_e2e_prod.sh
+./scripts/readiness_e2e_prod.sh .env.production
+
+# Or run deploy + readiness in one shot
+ACCORD_RUN_READINESS=1 ./scripts/deploy_docker_prod.sh .env.production
+```
+
+This boots:
+- `accord-redis` (distributed realtime bus)
+- `accord-backend` (FastAPI + secure SSE token flow)
+- `accord-frontend` (web dashboard)
+
+Smoke checks:
+
+```bash
+curl -fsS http://localhost:8000/api/v1/health
+curl -fsS "http://localhost:8000/api/v1/ca/events/token?ca_id=201" \
+  -H "X-Role: admin" \
+  -H "X-Admin-Id: 1001"
+```
+
+### 1.6️⃣ Nginx + HTTPS (VPS Launch)
+
+After your Docker stack is healthy, run this on your Ubuntu VPS to expose the API over TLS.
+
+```bash
+cd /Users/krish/Developer/Accord
+
+# Replace with your real API domain and email
+sudo bash scripts/setup_nginx_tls.sh api.accord-erp.com ops@accord-erp.com
+
+# Validate
+curl -fsS https://api.accord-erp.com/api/v1/health
+```
+
+Notes:
+- Ensure DNS A record for your API domain points to this VPS before running the script.
+- The script installs `nginx`, `certbot`, and `python3-certbot-nginx`, configures reverse proxy, and enables HTTPS redirect.
+- SSE endpoint `/api/v1/ca/events/stream` is configured with buffering off for real-time delivery.
 
 ---
 

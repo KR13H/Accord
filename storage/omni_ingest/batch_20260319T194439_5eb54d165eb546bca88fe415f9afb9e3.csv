@@ -1,0 +1,2 @@
+invoice_no,vendor,total_amount,date,gstin,hsn
+INV-001,Acme Supplies,12500.50,2026-03-18,29ABCDE1234F1Z5,847130

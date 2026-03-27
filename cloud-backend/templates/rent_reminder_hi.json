@@ -1,0 +1,4 @@
+{
+  "template_id": "rent_reminder_hi",
+  "message": "प्रिय किरायेदार {tenant_id}, आपका किराया INR {amount_due} दिनांक {due_date} को देय है। कृपया विलंब शुल्क से बचने के लिए समय पर भुगतान करें।"
+}
