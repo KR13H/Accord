@@ -69,24 +69,61 @@ from services.voucher_service import VoucherService
 from middleware.audit_logger import register_audit_logger_middleware
 from middleware.rbac import enforce_rbac_policy
 from routes.booking_routes import create_booking_router
-from routes.broker_routes import create_broker_router
+try:
+    from routes.broker_routes import create_broker_router
+except ModuleNotFoundError:  # pragma: no cover
+    create_broker_router = None
 from routes.chat_routes import create_chat_router
 from routes.invoice_routes import create_invoice_router
 from routes.portal_routes import create_portal_router
-from routes.pricing_routes import create_pricing_router
-from routes.project_routes import create_project_router
+try:
+    from routes.pricing_routes import create_pricing_router
+except ModuleNotFoundError:  # pragma: no cover
+    create_pricing_router = None
+
+try:
+    from routes.project_routes import create_project_router
+except ModuleNotFoundError:  # pragma: no cover
+    create_project_router = None
 from routes.sme_inventory_routes import create_sme_inventory_router
 from routes.sme_routes import create_sme_router
 from routes.support_routes import router as support_router
 from routes.tds_routes import create_phase7_router
 from routes.vendor_routes import create_vendor_router
 from routes.webhook_routes import create_webhook_router
-from services.approval_service import (
-    create_approval_router,
-    ensure_approval_schema,
-    get_allocation_approval_status,
-    initialize_allocation_approval,
-)
+try:
+    from services.approval_service import (
+        create_approval_router,
+        ensure_approval_schema,
+        get_allocation_approval_status,
+        initialize_allocation_approval,
+    )
+except ModuleNotFoundError:  # pragma: no cover
+    create_approval_router = None
+
+    def ensure_approval_schema(conn) -> None:  # noqa: ANN001
+        return None
+
+    def get_allocation_approval_status(conn, allocation_event_id: int) -> dict[str, Any]:  # noqa: ANN001
+        return {
+            "status": "unavailable",
+            "reason": "approval_service module not installed",
+            "allocation_event_id": allocation_event_id,
+        }
+
+    def initialize_allocation_approval(  # noqa: ANN001
+        conn,
+        allocation_event_id: int,
+        maker_admin_id: int,
+        receipt_amount: Decimal,
+    ) -> dict[str, Any]:
+        return {
+            "status": "unavailable",
+            "reason": "approval_service module not installed",
+            "allocation_event_id": allocation_event_id,
+            "maker_admin_id": maker_admin_id,
+            "receipt_amount": str(receipt_amount),
+        }
 from routers.mobile_gateway import router as mobile_gateway_router
 from utils.throttle import rate_limit_heavy_task
 
@@ -3959,16 +3996,20 @@ def require_admin_id(admin_id: str | None) -> int:
 
 
 app.include_router(create_booking_router(get_conn, require_role, require_admin_id))
-app.include_router(create_broker_router(get_conn))
+if create_broker_router is not None:
+    app.include_router(create_broker_router(get_conn))
 app.include_router(create_invoice_router(get_conn, require_role, require_admin_id))
 app.include_router(create_chat_router(get_conn, require_role, require_admin_id))
 app.include_router(create_vendor_router(get_conn))
 app.include_router(create_phase7_router(get_conn, require_role, require_admin_id))
 app.include_router(create_portal_router(get_conn))
-app.include_router(create_project_router(get_conn, require_role, require_admin_id))
+if create_project_router is not None:
+    app.include_router(create_project_router(get_conn, require_role, require_admin_id))
 app.include_router(create_webhook_router(get_conn))
-app.include_router(create_approval_router(get_conn, require_role, require_admin_id))
-app.include_router(create_pricing_router(get_conn, require_role, require_admin_id))
+if create_approval_router is not None:
+    app.include_router(create_approval_router(get_conn, require_role, require_admin_id))
+if create_pricing_router is not None:
+    app.include_router(create_pricing_router(get_conn, require_role, require_admin_id))
 app.include_router(create_kyc_router(require_role, require_admin_id))
 app.include_router(create_default_risk_router(get_conn, require_role, require_admin_id))
 app.include_router(support_router)
