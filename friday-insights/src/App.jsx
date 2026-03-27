@@ -16,6 +16,9 @@ import DraggableDashboard from "./DraggableDashboard";
 import BalanceSheet from "./BalanceSheet";
 import ProfitAndLoss from "./ProfitAndLoss";
 import GstFiling from "./GstFiling";
+import BrokerPortal from "./components/Brokers/BrokerPortal";
+import SmeDashboard from "./components/SME/SmeDashboard";
+import QuickSaleTerminal from "./components/SME/QuickSaleTerminal";
 import VendorPortal from "./components/Vendors/VendorPortal";
 import SupportChatWidget from "./components/AI/SupportChatWidget";
 import { ChatProvider } from "./context/ChatContext";
@@ -41,6 +44,9 @@ const NAV_ITEMS = [
   { to: "/profit-loss", label: "P&L" },
   { to: "/gst-filing", label: "GST" },
   { to: "/studio", label: "Studio" },
+  { to: "/sme-pos", label: "SME POS" },
+  { to: "/sme-dashboard", label: "SME Dash" },
+  { to: "/brokers/register", label: "Brokers" },
   { to: "/signup", label: "Signup" },
   { to: "/ca/dashboard", label: "CA" },
   { to: "/ca/heatmap", label: "Heatmap" },
@@ -58,6 +64,9 @@ const NAV_LABELS_HI = {
   "P&L": "लाभ-हानि",
   GST: "जीएसटी",
   Studio: "स्टूडियो",
+  "SME POS": "एसएमई पीओएस",
+  "SME Dash": "एसएमई डैश",
+  Brokers: "ब्रोकर",
   Signup: "साइनअप",
   CA: "सीए",
   Heatmap: "हीटमैप",
@@ -75,6 +84,9 @@ const NAV_LABELS_PA = {
   "P&L": "ਮੁਨਾਫਾ-ਨੁਕਸਾਨ",
   GST: "ਜੀਐਸਟੀ",
   Studio: "ਸਟੂਡੀਓ",
+  "SME POS": "ਐਸਐਮਈ ਪੀਓਐਸ",
+  "SME Dash": "ਐਸਐਮਈ ਡੈਸ਼",
+  Brokers: "ਬ੍ਰੋਕਰ",
   Signup: "ਸਾਈਨਅਪ",
   CA: "ਸੀਏ",
   Heatmap: "ਹੀਟਮੈਪ",
@@ -92,6 +104,9 @@ const NAV_LABELS_UR = {
   "P&L": "منافع و نقصان",
   GST: "جی ایس ٹی",
   Studio: "اسٹوڈیو",
+  "SME POS": "ایس ایم ای پی او ایس",
+  "SME Dash": "ایس ایم ای ڈیش",
+  Brokers: "بروکر",
   Signup: "سائن اپ",
   CA: "سی اے",
   Heatmap: "ہیٹ میپ",
@@ -248,10 +263,13 @@ function App() {
               <Route path="/profit-loss" element={<ProfitAndLoss />} />
               <Route path="/gst-filing" element={<GstFiling />} />
               <Route path="/studio" element={<StarkStudio />} />
+              <Route path="/brokers/register" element={<BrokerPortal />} />
               <Route path="/signup" element={<Signup />} />
               <Route path="/ca/dashboard" element={<CaDashboard />} />
               <Route path="/ca/heatmap" element={<CAHeatmap />} />
               <Route path="/ca/accept/:token" element={<CaAccept />} />
+              <Route path="/sme-pos" element={<QuickSaleTerminal />} />
+              <Route path="/sme-dashboard" element={<SmeDashboard />} />
               <Route path="/vendor/:vendorLinkId" element={<VendorPortal />} />
               <Route path="*" element={<Navigate to="/" replace />} />
             </Routes>

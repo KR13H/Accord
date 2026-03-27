@@ -57,6 +57,8 @@ from services.govt_bridge_service import GovtBridgeService
 from services.gst_service import GstService
 from services.ingest_service import IngestService
 from services.inventory_service import InventoryService
+from services.kyc_service import create_kyc_router
+from services.predictive_defaults import create_default_risk_router
 from services.report_service import ReportService
 from services.rera_allocation_service import AllocationInput, ReraAllocationService
 from services.realtime_events import ca_event_bus
@@ -67,13 +69,24 @@ from services.voucher_service import VoucherService
 from middleware.audit_logger import register_audit_logger_middleware
 from middleware.rbac import enforce_rbac_policy
 from routes.booking_routes import create_booking_router
+from routes.broker_routes import create_broker_router
 from routes.chat_routes import create_chat_router
 from routes.invoice_routes import create_invoice_router
 from routes.portal_routes import create_portal_router
+from routes.pricing_routes import create_pricing_router
+from routes.project_routes import create_project_router
+from routes.sme_inventory_routes import create_sme_inventory_router
+from routes.sme_routes import create_sme_router
 from routes.support_routes import router as support_router
 from routes.tds_routes import create_phase7_router
 from routes.vendor_routes import create_vendor_router
 from routes.webhook_routes import create_webhook_router
+from services.approval_service import (
+    create_approval_router,
+    ensure_approval_schema,
+    get_allocation_approval_status,
+    initialize_allocation_approval,
+)
 from routers.mobile_gateway import router as mobile_gateway_router
 from utils.throttle import rate_limit_heavy_task
 
@@ -2296,9 +2309,10 @@ def get_conn() -> sqlite3.Connection:
     # Cloud-ready bridge note:
     # Core ledger uses sqlite-compatible SQL currently. PostgreSQL is used through SQLAlchemy
     # for Stark Studio template storage until full ledger SQL dialect migration is completed.
-    conn = sqlite3.connect(SQLITE_DB_PATH)
+    conn = sqlite3.connect(SQLITE_DB_PATH, timeout=15.0, check_same_thread=False)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA foreign_keys = ON;")
+    conn.execute("PRAGMA journal_mode = WAL;")
     return conn
 
 
@@ -2766,6 +2780,7 @@ def init_db() -> None:
         backfill_chain_of_trust(conn)
         ensure_studio_schema_sqlite(conn)
         ensure_rera_allocation_service().ensure_schema(conn)
+        ensure_approval_schema(conn)
         ensure_commission_service().ensure_schema(conn)
         conn.commit()
 
@@ -3944,13 +3959,21 @@ def require_admin_id(admin_id: str | None) -> int:
 
 
 app.include_router(create_booking_router(get_conn, require_role, require_admin_id))
+app.include_router(create_broker_router(get_conn))
 app.include_router(create_invoice_router(get_conn, require_role, require_admin_id))
 app.include_router(create_chat_router(get_conn, require_role, require_admin_id))
 app.include_router(create_vendor_router(get_conn))
 app.include_router(create_phase7_router(get_conn, require_role, require_admin_id))
 app.include_router(create_portal_router(get_conn))
+app.include_router(create_project_router(get_conn, require_role, require_admin_id))
 app.include_router(create_webhook_router(get_conn))
+app.include_router(create_approval_router(get_conn, require_role, require_admin_id))
+app.include_router(create_pricing_router(get_conn, require_role, require_admin_id))
+app.include_router(create_kyc_router(require_role, require_admin_id))
+app.include_router(create_default_risk_router(get_conn, require_role, require_admin_id))
 app.include_router(support_router)
+app.include_router(create_sme_router(get_conn))
+app.include_router(create_sme_inventory_router(get_conn))
 
 
 def biometric_signature(admin_id: int, action: str, issued_at_unix: int) -> str:
@@ -6563,6 +6586,12 @@ def post_rera_allocation(
     with closing(get_conn()) as conn:
         service.ensure_schema(conn)
         row = fetch_rera_allocation_event_row(conn, int(result.event_id))
+        approval_status = initialize_allocation_approval(
+            conn,
+            allocation_event_id=int(result.event_id),
+            maker_admin_id=admin_id,
+            receipt_amount=payload.receipt_amount,
+        )
         if idempotency_key:
             now_iso = datetime.utcnow().isoformat(timespec="seconds") + "Z"
             conn.execute(
@@ -6587,6 +6616,7 @@ def post_rera_allocation(
         idempotency_key=idempotency_key,
         idempotency_replayed=False,
     )
+    response["approval_status"] = approval_status
     response["broker_commissions_released"] = released_commissions
     return response
 
@@ -6606,6 +6636,7 @@ def get_rera_allocations(
 
     service = ensure_rera_allocation_service()
     with closing(get_conn()) as conn:
+        conn.row_factory = sqlite3.Row
         service.ensure_schema(conn)
         if booking_id is not None and booking_id.strip() != "":
             rows = conn.execute(
@@ -6633,6 +6664,11 @@ def get_rera_allocations(
                 (limit,),
             ).fetchall()
 
+        approval_status_map = {
+            int(row["id"]): get_allocation_approval_status(conn, int(row["id"]))
+            for row in rows
+        }
+
     return {
         "status": "ok",
         "count": len(rows),
@@ -6652,6 +6688,7 @@ def get_rera_allocations(
                 "override_reason": row["override_reason"],
                 "actor_role": row["actor_role"],
                 "status": row["status"],
+                "approval_status": approval_status_map.get(int(row["id"]), "APPROVED"),
                 "created_at": row["created_at"],
             }
             for row in rows
