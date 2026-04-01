@@ -21,3 +21,7 @@ celery
 thefuzz
 python-Levenshtein
 polars
+alembic
+boto3
+cryptography
+slowapi
