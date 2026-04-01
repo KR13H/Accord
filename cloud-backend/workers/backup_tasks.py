@@ -6,6 +6,8 @@ import tarfile
 from datetime import datetime
 from pathlib import Path
 
+from services.postgres_backup_service import run_pg_backup
+from utils.db_runtime import is_postgres_url
 from workers.celery_app import celery
 
 DB_URL = os.getenv("DATABASE_URL", "sqlite:////app/ledger.db")
@@ -70,4 +72,21 @@ def run_daily_sqlite_backup() -> dict[str, str | int]:
         "archive": str(archive_path),
         "retention_days": RETENTION_DAYS,
         "removed_old_backups": removed_count,
+    }
+
+
+@celery.task(name="workers.backup_tasks.run_postgres_backup")
+def run_postgres_backup() -> dict[str, str | int]:
+    if not is_postgres_url(DB_URL):
+        return {
+            "status": "skipped",
+            "detail": "DATABASE_URL is not PostgreSQL",
+        }
+
+    result = run_pg_backup(dry_run=False)
+    return {
+        "status": str(result.get("status", "error")),
+        "detail": str(result.get("detail", "")),
+        "key": str(result.get("key", "")),
+        "uri": str(result.get("uri", "")),
     }

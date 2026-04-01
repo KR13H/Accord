@@ -1,0 +1,51 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: accord-backend
+  namespace: accord
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: accord-backend
+  template:
+    metadata:
+      labels:
+        app: accord-backend
+    spec:
+      containers:
+      - name: backend
+        image: ghcr.io/kr13h/accord-backend:latest
+        imagePullPolicy: IfNotPresent
+        ports:
+        - containerPort: 8000
+        envFrom:
+        - configMapRef:
+            name: accord-config
+        - secretRef:
+            name: accord-secrets
+        readinessProbe:
+          httpGet:
+            path: /health
+            port: 8000
+          initialDelaySeconds: 10
+          periodSeconds: 10
+        livenessProbe:
+          httpGet:
+            path: /health
+            port: 8000
+          initialDelaySeconds: 20
+          periodSeconds: 20
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: accord-backend
+  namespace: accord
+spec:
+  selector:
+    app: accord-backend
+  ports:
+  - name: http
+    port: 8000
+    targetPort: 8000

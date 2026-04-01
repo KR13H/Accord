@@ -1,4 +1,24 @@
 services:
+  postgres:
+    image: postgres:16
+    container_name: accord-postgres
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-accord}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-accord}
+      POSTGRES_DB: ${POSTGRES_DB:-accord}
+    ports:
+      - "5432:5432"
+    volumes:
+      - accord_postgres_data:/var/lib/postgresql/data
+    restart: unless-stopped
+
+  redis:
+    image: redis:7
+    container_name: accord-redis
+    ports:
+      - "6379:6379"
+    restart: unless-stopped
+
   backend:
     build:
       context: .
@@ -6,6 +26,14 @@ services:
     container_name: accord-backend
     environment:
       DATABASE_URL: ${DATABASE_URL:-sqlite:////app/data/ledger.db}
+      REDIS_URL: ${REDIS_URL:-redis://redis:6379/0}
+      CELERY_BROKER_URL: ${CELERY_BROKER_URL:-redis://redis:6379/0}
+      CELERY_RESULT_BACKEND: ${CELERY_RESULT_BACKEND:-redis://redis:6379/1}
+      ACCORD_STORAGE_BACKEND: ${ACCORD_STORAGE_BACKEND:-local}
+      ACCORD_S3_BUCKET: ${ACCORD_S3_BUCKET}
+      ACCORD_S3_REGION: ${ACCORD_S3_REGION:-ap-south-1}
+      ACCORD_S3_ENDPOINT_URL: ${ACCORD_S3_ENDPOINT_URL}
+      ACCORD_BACKUP_ENCRYPTION_KEY: ${ACCORD_BACKUP_ENCRYPTION_KEY}
       ACCORD_BACKUP_DIR: ${ACCORD_BACKUP_DIR:-/app/backups}
       ACCORD_BACKUP_RETENTION_DAYS: ${ACCORD_BACKUP_RETENTION_DAYS:-7}
       OLLAMA_HOST: ${OLLAMA_HOST:-http://host.docker.internal:11434}
@@ -24,6 +52,8 @@ services:
       - accord_backend_db:/app/data
       - accord_backend_backups:/app/backups
     restart: unless-stopped
+    depends_on:
+      - redis
 
   frontend:
     build:
@@ -41,3 +71,4 @@ services:
 volumes:
   accord_backend_db:
   accord_backend_backups:
+  accord_postgres_data:

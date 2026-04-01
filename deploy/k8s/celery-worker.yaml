@@ -1,0 +1,25 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: accord-celery-worker
+  namespace: accord
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: accord-celery-worker
+  template:
+    metadata:
+      labels:
+        app: accord-celery-worker
+    spec:
+      containers:
+      - name: worker
+        image: ghcr.io/kr13h/accord-backend:latest
+        imagePullPolicy: IfNotPresent
+        command: ["celery", "-A", "workers.celery_app:celery", "worker", "-l", "INFO"]
+        envFrom:
+        - configMapRef:
+            name: accord-config
+        - secretRef:
+            name: accord-secrets
