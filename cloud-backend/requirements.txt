@@ -18,6 +18,7 @@ networkx
 twilio
 redis
 celery
+razorpay
 thefuzz
 python-Levenshtein
 polars

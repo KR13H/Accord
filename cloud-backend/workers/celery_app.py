@@ -12,7 +12,14 @@ RESULT_BACKEND = os.getenv("CELERY_RESULT_BACKEND", "redis://localhost:6379/1")
 celery = Celery("accord_workers", broker=BROKER_URL, backend=RESULT_BACKEND)
 celery.conf.timezone = "Asia/Kolkata"
 celery.conf.enable_utc = True
-celery.conf.imports = ("workers.rent_tasks", "workers.backup_tasks")
+celery.conf.imports = (
+    "workers.rent_tasks",
+    "workers.backup_tasks",
+    "workers.datalake_tasks",
+    "workers.anonymizer_tasks",
+    "services.demand_generator",
+    "services.autonomous_purchasing",
+)
 celery.conf.beat_schedule = {
     "generate-monthly-rent-invoices-daily": {
         "task": "workers.rent_tasks.generate_monthly_rent_invoices",
@@ -21,5 +28,17 @@ celery.conf.beat_schedule = {
     "daily-sqlite-backup": {
         "task": "workers.backup_tasks.run_daily_sqlite_backup",
         "schedule": crontab(hour=2, minute=0),
-    }
+    },
+    "weekly-datalake-parquet-export": {
+        "task": "workers.datalake_tasks.export_to_parquet",
+        "schedule": crontab(day_of_week="sun", hour=3, minute=15),
+    },
+    "postgres-backup-every-6-hours": {
+        "task": "workers.backup_tasks.run_postgres_backup",
+        "schedule": crontab(minute=0, hour="*/6"),
+    },
+    "dpdp-anonymize-inactive-pii-monthly": {
+        "task": "workers.anonymizer_tasks.scrub_inactive_pii",
+        "schedule": crontab(day_of_month=1, hour=1, minute=30),
+    },
 }

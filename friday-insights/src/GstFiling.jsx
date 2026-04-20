@@ -2,11 +2,13 @@ import { useEffect, useState } from "react";
 import { motion } from "framer-motion";
 import { Activity, AlertTriangle, CheckCircle2, Loader2, PlayCircle, ShieldCheck, Zap } from "lucide-react";
 import AuditTimeline from "./components/AuditTimeline";
+import { buildSmeHeaders } from "./api/smeAuth";
 
 const PREPARE_ENDPOINT = "/api/v1/statutory/gstr1/prepare";
 const PREPARE_FALLBACK_ENDPOINT = "/api/v1/statutory/gstr1/generate";
 const APPROVE_ENDPOINT = "/api/v1/statutory/gstr1/approve";
 const APPROVE_FALLBACK_ENDPOINT = "/api/v1/statutory/gstr1/file-success";
+const GSTN_FILE_ENDPOINT = "/api/v1/sme/compliance/file-gstr1";
 
 function normalizeIssues(payload) {
   if (!payload || typeof payload !== "object") return [];
@@ -45,16 +47,20 @@ export default function GstFiling() {
   const [summary, setSummary] = useState({});
   const [prepareEndpointUsed, setPrepareEndpointUsed] = useState(PREPARE_ENDPOINT);
   const [approveEndpointUsed, setApproveEndpointUsed] = useState(APPROVE_ENDPOINT);
+  const [gstnEndpointUsed, setGstnEndpointUsed] = useState(GSTN_FILE_ENDPOINT);
   const [lastAction, setLastAction] = useState("Idle");
   const [auditLogs, setAuditLogs] = useState([]);
   const [concurrency, setConcurrency] = useState({ running: false, ok: 0, failed: 0, avgMs: 0, endpoint: PREPARE_ENDPOINT });
   const [investorMode, setInvestorMode] = useState({ running: false, lastRun: null, error: "" });
+  const [gstin, setGstin] = useState("27ABCDE1234F1Z5");
 
   const headers = {
     "Content-Type": "application/json",
     "X-Role": role,
     "X-Admin-Id": adminId,
   };
+
+  const complianceHeaders = buildSmeHeaders(headers, { role });
 
   const blockerCount = issues.filter((issue) => issue.severity === "BLOCKER").length;
   const warningCount = issues.filter((issue) => issue.severity !== "BLOCKER").length;
@@ -87,7 +93,7 @@ export default function GstFiling() {
 
     const primary = await fetch(PREPARE_ENDPOINT, {
       method: "POST",
-      headers,
+      headers: complianceHeaders,
       body: JSON.stringify(payload),
     });
 
@@ -99,7 +105,7 @@ export default function GstFiling() {
 
     const fallback = await fetch(PREPARE_FALLBACK_ENDPOINT, {
       method: "POST",
-      headers,
+      headers: complianceHeaders,
       body: JSON.stringify(payload),
     });
     const body = await fallback.json();
@@ -143,7 +149,7 @@ export default function GstFiling() {
     try {
       const primary = await fetch(APPROVE_ENDPOINT, {
         method: "POST",
-        headers,
+        headers: complianceHeaders,
         body: JSON.stringify({
           filing_id: filingId,
           period,
@@ -158,7 +164,7 @@ export default function GstFiling() {
       } else {
         const fallback = await fetch(APPROVE_FALLBACK_ENDPOINT, {
           method: "POST",
-          headers,
+          headers: complianceHeaders,
           body: JSON.stringify({
             period,
             filing_reference: `ACK-${Date.now()}`,
@@ -232,7 +238,7 @@ export default function GstFiling() {
     try {
       const res = await fetch("/api/v1/statutory/investor-mode/run", {
         method: "POST",
-        headers,
+        headers: complianceHeaders,
         body: JSON.stringify({ period, run_concurrency: 50 }),
       });
       const data = await res.json();
@@ -273,6 +279,40 @@ export default function GstFiling() {
     }
   };
 
+  const fileViaGstnSandbox = async () => {
+    setStatus("filing");
+    setError("");
+    setLastAction("Submitting direct GSTN sandbox filing");
+
+    try {
+      const response = await fetch(GSTN_FILE_ENDPOINT, {
+        method: "POST",
+        headers: complianceHeaders,
+        body: JSON.stringify({
+          business_id: "SME-001",
+          gstin,
+          period: period.replace("-", ""),
+        }),
+      });
+
+      const body = await response.json();
+      if (!response.ok) {
+        throw new Error(body?.detail || `GSTN filing failed (${response.status})`);
+      }
+
+      setGstnEndpointUsed(GSTN_FILE_ENDPOINT);
+      setResult(body);
+      setFilingStatus("FILED");
+      setStatus("filed");
+      setLastAction(`GSTN sandbox ARN ${body?.arn || "generated"}`);
+      await fetchAudit();
+    } catch (e) {
+      setStatus("approved");
+      setError(e instanceof Error ? e.message : "Failed to file via GSTN sandbox");
+      setLastAction("GSTN sandbox filing failed");
+    }
+  };
+
   return (
     <div className="min-h-screen bg-[#000000] text-[#FFFFFF] p-6 sm:p-10 lg:p-12" style={{ fontFamily: "ui-monospace, SFMono-Regular, Menlo, monospace" }}>
       <header className="mb-10 sm:mb-12">
@@ -293,6 +333,12 @@ export default function GstFiling() {
                 onChange={(event) => setPeriod(event.target.value)}
                 className="bg-slate-950 border border-slate-700 rounded-md px-3 py-2 text-xs"
                 placeholder="YYYY-MM"
+              />
+              <input
+                value={gstin}
+                onChange={(event) => setGstin(event.target.value)}
+                className="bg-slate-950 border border-slate-700 rounded-md px-3 py-2 text-xs"
+                placeholder="GSTIN"
               />
               <input
                 value={role}
@@ -344,6 +390,14 @@ export default function GstFiling() {
             </button>
 
             <button
+              onClick={fileViaGstnSandbox}
+              disabled={status === "filing"}
+              className="mt-2 w-full py-3 border border-emerald-400/45 bg-emerald-900/20 text-emerald-100 font-black uppercase tracking-widest hover:bg-emerald-800/30 transition-colors disabled:opacity-40"
+            >
+              {status === "filing" ? "Submitting ARN..." : "File via GSTN Sandbox"}
+            </button>
+
+            <button
               onClick={() => runConcurrencyProbe(50)}
               disabled={concurrency.running}
               className="mt-2 w-full py-3 border border-cyan-500/45 bg-cyan-900/20 text-cyan-100 font-black uppercase tracking-widest hover:bg-cyan-800/30 transition-colors disabled:opacity-40"
@@ -366,6 +420,7 @@ export default function GstFiling() {
               <p className="text-[10px] uppercase tracking-[0.16em] text-slate-400">Endpoints</p>
               <p className="text-[11px] mt-1 text-cyan-200 break-all">Prepare: {prepareEndpointUsed}</p>
               <p className="text-[11px] text-cyan-200 break-all">Approve: {approveEndpointUsed}</p>
+              <p className="text-[11px] text-cyan-200 break-all">GSTN File: {gstnEndpointUsed}</p>
               <p className="text-[11px] text-slate-300 mt-1">Last action: {lastAction}</p>
             </div>
 

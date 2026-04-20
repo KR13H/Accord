@@ -14,12 +14,17 @@ function shortDateLabel(isoDate) {
   return parsed.toLocaleDateString("en-IN", { month: "short", day: "numeric" });
 }
 
-export default function SmeDashboard() {
+export default function SmeDashboard({ syncEvent }) {
   const [weeklyRows, setWeeklyRows] = useState([]);
   const [todayRevenue, setTodayRevenue] = useState(0);
   const [todayTransactions, setTodayTransactions] = useState(0);
+  const [predictions, setPredictions] = useState([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState("");
+  const smeRole = useMemo(() => {
+    const role = window.localStorage.getItem("smeRole");
+    return role && role.trim() ? role.trim().toLowerCase() : "owner";
+  }, []);
 
   useEffect(() => {
     let mounted = true;
@@ -35,7 +40,11 @@ export default function SmeDashboard() {
         });
 
         const responses = await Promise.all(
-          dates.map((day) => fetch(`/api/v1/sme/summary?target_date=${encodeURIComponent(day)}`))
+          dates.map((day) =>
+            fetch(`/api/v1/sme/summary?target_date=${encodeURIComponent(day)}`, {
+              headers: { "X-SME-Role": smeRole },
+            })
+          )
         );
 
         const payloads = await Promise.all(responses.map((res) => res.json()));
@@ -56,6 +65,10 @@ export default function SmeDashboard() {
         const today = rows[rows.length - 1] || { income: 0, transactions: 0 };
         setTodayRevenue(today.income);
         setTodayTransactions(today.transactions);
+
+        const predictionRes = await fetch("/api/v1/sme/inventory/restock-predictions");
+        const predictionPayload = await predictionRes.json();
+        setPredictions(Array.isArray(predictionPayload?.predictions) ? predictionPayload.predictions : []);
       } catch (err) {
         if (!mounted) return;
         setError(err?.message || "Unable to load SME dashboard");
@@ -70,7 +83,46 @@ export default function SmeDashboard() {
     return () => {
       mounted = false;
     };
-  }, []);
+  }, [smeRole]);
+
+  useEffect(() => {
+    if (!syncEvent) {
+      return;
+    }
+    if (syncEvent.event !== "TRANSACTION_RECORDED" && syncEvent.event !== "INVENTORY_UPDATED") {
+      return;
+    }
+
+    let cancelled = false;
+      const refresh = async () => {
+      try {
+        const todayIso = new Date().toISOString().slice(0, 10);
+        const response = await fetch(`/api/v1/sme/summary?target_date=${encodeURIComponent(todayIso)}`, {
+          headers: { "X-SME-Role": smeRole },
+        });
+        const payload = await response.json();
+        if (cancelled) {
+          return;
+        }
+        const summary = payload?.summary || {};
+        setTodayRevenue(Number.parseFloat(summary.income_total || "0") || 0);
+        setTodayTransactions(Number.parseInt(summary.transaction_count || 0, 10) || 0);
+
+        const predictionRes = await fetch("/api/v1/sme/inventory/restock-predictions");
+        const predictionPayload = await predictionRes.json();
+        if (!cancelled) {
+          setPredictions(Array.isArray(predictionPayload?.predictions) ? predictionPayload.predictions : []);
+        }
+      } catch {
+        // Keep stale values if refresh fails.
+      }
+    };
+
+    refresh();
+    return () => {
+      cancelled = true;
+    };
+  }, [syncEvent, smeRole]);
 
   const totalWeekRevenue = useMemo(() => weeklyRows.reduce((sum, row) => sum + row.income, 0), [weeklyRows]);
 
@@ -120,6 +172,23 @@ export default function SmeDashboard() {
               </ResponsiveContainer>
             )}
           </div>
+        </div>
+
+        <div className="rounded-3xl border border-slate-700 bg-slate-900/80 p-4 md:p-6 mt-6">
+          <h2 className="text-xl md:text-2xl font-black text-cyan-100 mb-3">Predictive Restock (Next 7 Days)</h2>
+          {predictions.length === 0 ? (
+            <p className="text-slate-300 text-sm">No prediction data yet. Record a few days of sales to unlock restock AI.</p>
+          ) : (
+            <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
+              {predictions.slice(0, 8).map((prediction, index) => (
+                <div key={`${prediction.item_name}-${index}`} className="rounded-2xl border border-cyan-400/25 bg-cyan-500/10 p-4">
+                  <p className="text-cyan-100 font-semibold">{prediction.item_name}</p>
+                  <p className="text-2xl font-black mt-1">Order {prediction.predicted_order_qty}</p>
+                  <p className="text-xs text-cyan-50/80 mt-2">{prediction.justification}</p>
+                </div>
+              ))}
+            </div>
+          )}
         </div>
       </div>
     </div>

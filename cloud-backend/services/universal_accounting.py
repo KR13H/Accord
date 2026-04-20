@@ -5,6 +5,8 @@ from datetime import date, datetime
 from decimal import Decimal
 from typing import Any, Callable
 
+from websockets.sme_sync import fire_and_forget_business_event
+
 
 DEFAULT_BUSINESS_ID = "SME-001"
 VALID_TRANSACTION_TYPES = {"INCOME", "EXPENSE"}
@@ -99,6 +101,25 @@ def record_transaction(
     payload = _row_to_dict(created)
     if payload is None:
         raise RuntimeError("failed to read inserted transaction")
+
+    fire_and_forget_business_event(
+        clean_business_id,
+        {
+            "event": "TRANSACTION_RECORDED",
+            "business_id": clean_business_id,
+            "transaction": payload,
+        },
+    )
+    fire_and_forget_business_event(
+        clean_business_id,
+        {
+            "event": "INVENTORY_UPDATED",
+            "business_id": clean_business_id,
+            "item_id": None,
+            "new_stock": None,
+            "transaction_id": int(payload["id"]),
+        },
+    )
     return payload
 
 

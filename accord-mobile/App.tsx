@@ -26,6 +26,8 @@ import { useOfflineVoiceQueue } from "./hooks/useOfflineVoiceQueue";
 import { useSyncWorker } from "./hooks/useSyncWorker";
 import { useAccordHaptics } from "./hooks/useAccordHaptics";
 import { SpvProvider } from "./src/context/SpvContext";
+import ReportsScreen from "./src/screens/ReportsScreen";
+import { promptAccordUnlock } from "./src/services/Biometrics";
 import { registerPushNotifications, subscribePushTokenRefresh } from "./src/services/PushNotifications";
 
 type Txn = {
@@ -49,6 +51,7 @@ const REQUEST_TIMEOUT_MS = 12000;
 const SSE_MAX_BACKOFF_MS = 20000;
 const SESSION_TOKEN_KEY = "accord.mobile.sessionToken";
 const SESSION_CREATED_KEY = "accord.mobile.sessionCreatedAt";
+const REPORTS_PIN_FALLBACK = "2580";
 
 const LANGUAGE_ORDER: Array<"en" | "hi" | "pa" | "ur"> = ["en", "hi", "pa", "ur"];
 const LANGUAGE_NAMES: Record<"en" | "hi" | "pa" | "ur", string> = {
@@ -181,6 +184,9 @@ function AppScreen() {
   const [offlineSyncInFlight, setOfflineSyncInFlight] = useState(false);
   const [language, setLanguage] = useState<"en" | "hi" | "pa" | "ur">("en");
   const [simpleMode, setSimpleMode] = useState(true);
+  const [reportsUnlocked, setReportsUnlocked] = useState(false);
+  const [showPinFallback, setShowPinFallback] = useState(false);
+  const [pinInput, setPinInput] = useState("");
 
   const chunkQueueRef = useRef<string[]>([]);
   const transcriptBufferRef = useRef<string[]>([]);
@@ -193,6 +199,18 @@ function AppScreen() {
   const { triggerSuccess, triggerError, triggerTap, triggerHeavySync } = useAccordHaptics();
   const t = (key: string) => I18N[language]?.[key] || I18N.en[key] || key;
   const voiceLocale = language === "en" ? "en-IN" : "hi-IN";
+
+  const promptReportsUnlock = useCallback(async () => {
+    const unlocked = await promptAccordUnlock();
+    setReportsUnlocked(unlocked);
+    setShowPinFallback(!unlocked);
+    if (unlocked) {
+      setPinInput("");
+      appendLog("Biometric unlock success for reports view.");
+    } else {
+      appendLog("Biometric unlock not completed. PIN fallback required.");
+    }
+  }, []);
 
   const headers = useMemo(
     () => ({
@@ -522,6 +540,7 @@ function AppScreen() {
         }
       }
       if (prevState.match(/inactive|background/) && nextState === "active") {
+        void promptReportsUnlock();
         if (pausedBySystem) {
           appendLog("App resumed. You can restart microphone safely.");
         }
@@ -538,6 +557,7 @@ function AppScreen() {
         setSessionToken(storedToken);
         appendLog("Recovered secure mobile session token.");
       }
+      await promptReportsUnlock();
     })();
 
     Voice.onSpeechResults = async (event: { value?: string[] }) => {
@@ -573,7 +593,7 @@ function AppScreen() {
       void Voice.destroy();
       Voice.removeAllListeners();
     };
-  }, [buildHeaders, isListening, pausedBySystem, voiceSessionId]);
+  }, [buildHeaders, isListening, pausedBySystem, promptReportsUnlock, voiceSessionId]);
 
   useEffect(() => {
     if (sessionToken) {
@@ -851,6 +871,20 @@ function AppScreen() {
     }
   };
 
+  const unlockWithPin = async () => {
+    if (pinInput.trim() === REPORTS_PIN_FALLBACK) {
+      setReportsUnlocked(true);
+      setShowPinFallback(false);
+      setPinInput("");
+      appendLog("Reports unlocked with PIN fallback.");
+      await triggerSuccess();
+      return;
+    }
+
+    appendLog("Incorrect PIN entered for reports unlock.");
+    await triggerError();
+  };
+
   return (
     <PaperProvider theme={AccordDarkTheme}>
       <PrivacyShield>
@@ -872,6 +906,38 @@ function AppScreen() {
         </View>
         <Text style={[styles.title, simpleMode ? styles.titleSimple : null]}>{t("app_title")}</Text>
         <Text style={[styles.subtitle, simpleMode ? styles.subtitleSimple : null]}>{t("app_subtitle")}</Text>
+
+        <View style={styles.cardFull}>
+          <Text style={styles.cardTitle}>Reports Security</Text>
+          {!reportsUnlocked ? (
+            <>
+              <Text style={styles.meta}>Unlock Accord Mobile to open ReportsScreen.</Text>
+              <TouchableOpacity style={styles.button} onPress={promptReportsUnlock}>
+                <Text style={styles.buttonText}>Unlock Accord Mobile</Text>
+              </TouchableOpacity>
+              {showPinFallback ? (
+                <>
+                  <TextInput
+                    style={styles.input}
+                    value={pinInput}
+                    secureTextEntry
+                    keyboardType="number-pad"
+                    onChangeText={setPinInput}
+                    placeholder="Enter fallback PIN"
+                    placeholderTextColor="#8ca0c0"
+                  />
+                  <TouchableOpacity style={styles.inlineButton} onPress={unlockWithPin}>
+                    <Text style={styles.inlineButtonText}>Unlock With PIN</Text>
+                  </TouchableOpacity>
+                </>
+              ) : null}
+            </>
+          ) : (
+            <View style={{ height: 320 }}>
+              <ReportsScreen language={language} onSelectReport={(id) => appendLog(`Report selected: ${id}`)} />
+            </View>
+          )}
+        </View>
 
         {!networkOnline ? <Text style={styles.bannerWarn}>Offline mode: requests will retry when network returns.</Text> : null}
         {retryingRequest ? <Text style={styles.bannerInfo}>Retrying unstable network request...</Text> : null}
