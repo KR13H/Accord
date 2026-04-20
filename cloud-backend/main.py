@@ -35,6 +35,7 @@ import httpx
 from pydantic import BaseModel, Field
 from reportlab.lib.pagesizes import A4
 from reportlab.pdfgen import canvas
+from starlette.middleware.base import BaseHTTPMiddleware
 
 try:
     from sqlalchemy import create_engine, text
@@ -74,7 +75,9 @@ try:
 except ModuleNotFoundError:  # pragma: no cover
     create_broker_router = None
 from routes.chat_routes import create_chat_router
+from routes.billing_routes import create_billing_router
 from routes.invoice_routes import create_invoice_router
+from routes.otp_auth_routes import create_otp_auth_router
 from routes.portal_routes import create_portal_router
 try:
     from routes.pricing_routes import create_pricing_router
@@ -85,12 +88,18 @@ try:
     from routes.project_routes import create_project_router
 except ModuleNotFoundError:  # pragma: no cover
     create_project_router = None
+    from routes.autonomous_purchasing_routes import create_autonomous_purchasing_router
+    from routes.gstn_sandbox_routes import create_gstn_sandbox_router
+    from routes.sme_webauthn_routes import create_sme_webauthn_router
 from routes.sme_inventory_routes import create_sme_inventory_router
+from routes.iot_telemetry_routes import create_iot_telemetry_router
+from routes.sme_payable_routes import create_sme_payable_router
 from routes.sme_routes import create_sme_router
 from routes.support_routes import router as support_router
 from routes.tds_routes import create_phase7_router
 from routes.vendor_routes import create_vendor_router
 from routes.webhook_routes import create_webhook_router
+from websockets.sme_sync import create_sme_sync_router
 try:
     from services.approval_service import (
         create_approval_router,
@@ -126,25 +135,16 @@ except ModuleNotFoundError:  # pragma: no cover
         }
 from routers.mobile_gateway import router as mobile_gateway_router
 from utils.throttle import rate_limit_heavy_task
+from utils.db_runtime import (
+    get_database_url,
+    is_postgres_url,
+    resolve_sqlite_db_path,
+    sqlalchemy_database_url,
+)
 
 
-DB_PATH = Path(__file__).with_name("ledger.db")
-DATABASE_URL = os.getenv("DATABASE_URL", f"sqlite:///{DB_PATH}")
-if DATABASE_URL.startswith("postgres://"):
-    DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql://", 1)
-
-
-def resolve_sqlite_db_path(database_url: str) -> Path:
-    if not database_url.startswith("sqlite:///"):
-        return DB_PATH
-    raw = database_url.replace("sqlite:///", "", 1)
-    path = Path(raw)
-    if not path.is_absolute():
-        path = Path(__file__).with_name(raw)
-    return path
-
-
-DB_BACKEND = "postgresql" if DATABASE_URL.startswith("postgresql://") else "sqlite"
+DATABASE_URL = get_database_url()
+DB_BACKEND = "postgresql" if is_postgres_url(DATABASE_URL) else "sqlite"
 SQLITE_DB_PATH = resolve_sqlite_db_path(DATABASE_URL)
 
 CHART_OF_ACCOUNTS = [
@@ -213,10 +213,45 @@ CORS_DEFAULT_ORIGINS = [
 
 
 def resolve_cors_allow_origins() -> list[str]:
+    frontend_base = os.getenv("VITE_API_BASE_URL", "").strip()
     raw = os.getenv("CORS_ALLOW_ORIGINS", "").strip()
-    if not raw:
-        return CORS_DEFAULT_ORIGINS
-    return [origin.strip() for origin in raw.split(",") if origin.strip()]
+    if raw:
+        requested = [origin.strip() for origin in raw.split(",") if origin.strip()]
+    elif frontend_base:
+        requested = [frontend_base]
+    else:
+        requested = CORS_DEFAULT_ORIGINS
+
+    allow: list[str] = []
+    for origin in requested:
+        if origin == "*":
+            continue
+        allow.append(origin)
+
+    return allow or CORS_DEFAULT_ORIGINS
+
+
+SECURITY_CSP_POLICY = (
+    "default-src 'self'; "
+    "script-src 'self' https://checkout.razorpay.com https://api.razorpay.com; "
+    "connect-src 'self' https://api.razorpay.com; "
+    "img-src 'self' data: https://*.razorpay.com; "
+    "style-src 'self' 'unsafe-inline'; "
+    "frame-src 'self' https://api.razorpay.com https://checkout.razorpay.com; "
+    "object-src 'none'; "
+    "base-uri 'self'; "
+    "form-action 'self';"
+)
+
+
+class SecurityHeadersMiddleware(BaseHTTPMiddleware):
+    async def dispatch(self, request: Request, call_next):
+        response = await call_next(request)
+        response.headers["Strict-Transport-Security"] = "max-age=63072000; includeSubDomains; preload"
+        response.headers["X-Content-Type-Options"] = "nosniff"
+        response.headers["X-Frame-Options"] = "DENY"
+        response.headers["Content-Security-Policy"] = SECURITY_CSP_POLICY
+        return response
 
 try:
     import cv2  # type: ignore
@@ -2271,11 +2306,12 @@ def ensure_commission_service() -> CommissionService:
 app.add_middleware(
     CORSMiddleware,
     allow_origins=cors_allow_origins,
-    allow_origin_regex=cors_allow_origin_regex,
+    allow_origin_regex=None,
     allow_credentials=cors_allow_credentials,
     allow_methods=["*"],
     allow_headers=["*"],
 )
+app.add_middleware(SecurityHeadersMiddleware)
 
 app.include_router(mobile_gateway_router)
 
@@ -2359,7 +2395,7 @@ register_audit_logger_middleware(app, get_conn)
 SQLA_ENGINE = None
 if DB_BACKEND == "postgresql" and create_engine is not None:
     try:
-        SQLA_ENGINE = create_engine(DATABASE_URL, pool_pre_ping=True, future=True)
+        SQLA_ENGINE = create_engine(sqlalchemy_database_url(DATABASE_URL), pool_pre_ping=True, future=True)
     except Exception:  # noqa: BLE001
         SQLA_ENGINE = None
 
@@ -2724,6 +2760,16 @@ def init_db() -> None:
                 FOREIGN KEY(account_id) REFERENCES accounts(id) ON DELETE RESTRICT
             );
 
+            CREATE TABLE IF NOT EXISTS sme_subscriptions (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                business_id TEXT NOT NULL,
+                razorpay_subscription_id TEXT NOT NULL UNIQUE,
+                status TEXT NOT NULL DEFAULT 'PENDING',
+                current_period_end TEXT NULL,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
+
             CREATE TABLE IF NOT EXISTS audit_edit_logs (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 table_name TEXT NOT NULL,
@@ -2747,6 +2793,7 @@ def init_db() -> None:
 
             CREATE INDEX IF NOT EXISTS idx_journal_lines_entry_id ON journal_lines(entry_id);
             CREATE INDEX IF NOT EXISTS idx_journal_lines_account_id ON journal_lines(account_id);
+            CREATE INDEX IF NOT EXISTS idx_sme_subscriptions_business_status ON sme_subscriptions(business_id, status);
             CREATE INDEX IF NOT EXISTS idx_audit_edit_logs_table_record ON audit_edit_logs(table_name, record_id);
             CREATE INDEX IF NOT EXISTS idx_audit_logs_endpoint_timestamp ON audit_logs(endpoint, timestamp DESC);
             CREATE INDEX IF NOT EXISTS idx_audit_logs_user_timestamp ON audit_logs(user_id, timestamp DESC);
@@ -3154,8 +3201,19 @@ def migrate_legacy_schema(conn: sqlite3.Connection) -> None:
             UNIQUE(sku_code, batch_code)
         );
 
+        CREATE TABLE IF NOT EXISTS sme_subscriptions (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            business_id TEXT NOT NULL,
+            razorpay_subscription_id TEXT NOT NULL UNIQUE,
+            status TEXT NOT NULL DEFAULT 'PENDING',
+            current_period_end TEXT NULL,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        );
+
         CREATE INDEX IF NOT EXISTS idx_vendor_trust_score ON vendor_trust_scores(filing_consistency_score);
         CREATE INDEX IF NOT EXISTS idx_safe_harbor_attestations_as_of ON safe_harbor_attestations(as_of_date, created_at);
+        CREATE INDEX IF NOT EXISTS idx_sme_subscriptions_business_status ON sme_subscriptions(business_id, status);
         CREATE INDEX IF NOT EXISTS idx_ca_invites_email_status ON ca_invites(email, status);
         CREATE INDEX IF NOT EXISTS idx_ca_invites_expires_status ON ca_invites(expires_at, status);
         CREATE INDEX IF NOT EXISTS idx_ca_alert_rules_enabled ON ca_alert_rules(enabled, updated_at);
@@ -4006,6 +4064,7 @@ app.include_router(create_portal_router(get_conn))
 if create_project_router is not None:
     app.include_router(create_project_router(get_conn, require_role, require_admin_id))
 app.include_router(create_webhook_router(get_conn))
+app.include_router(create_billing_router(get_conn))
 if create_approval_router is not None:
     app.include_router(create_approval_router(get_conn, require_role, require_admin_id))
 if create_pricing_router is not None:
@@ -4015,6 +4074,13 @@ app.include_router(create_default_risk_router(get_conn, require_role, require_ad
 app.include_router(support_router)
 app.include_router(create_sme_router(get_conn))
 app.include_router(create_sme_inventory_router(get_conn))
+app.include_router(create_sme_payable_router(get_conn))
+app.include_router(create_autonomous_purchasing_router(get_conn))
+app.include_router(create_iot_telemetry_router(get_conn))
+app.include_router(create_sme_webauthn_router(get_conn))
+app.include_router(create_otp_auth_router(get_conn))
+app.include_router(create_gstn_sandbox_router(get_conn, require_role, require_admin_id))
+app.include_router(create_sme_sync_router())
 
 
 def biometric_signature(admin_id: int, action: str, issued_at_unix: int) -> str:

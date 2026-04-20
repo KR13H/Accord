@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import sqlite3
 from datetime import date
 from decimal import Decimal
 from typing import Any
@@ -7,6 +8,7 @@ from typing import Any
 from fastapi import APIRouter, Header, HTTPException
 from pydantic import BaseModel, Field
 
+from routes.broker_routes import auto_link_broker_lead, ensure_broker_lead_schema
 from services.commission_service import CommissionService
 from services.booking_service import BookingService
 from services.tds_service import TdsService
@@ -102,12 +104,32 @@ def create_booking_router(get_conn: callable, require_role: callable, require_ad
                     "status": payload.status,
                 }
             )
+
+            if not (payload.broker_id and payload.broker_id.strip()):
+                with get_conn() as conn:
+                    conn.row_factory = sqlite3.Row
+                    ensure_broker_lead_schema(conn)
+                    broker_id = auto_link_broker_lead(
+                        conn,
+                        project_id=payload.project_id,
+                        customer_name=payload.customer_name,
+                        booking_id=payload.booking_id,
+                    )
+                    if broker_id:
+                        conn.execute(
+                            "UPDATE sales_bookings SET broker_id = ? WHERE booking_id = ?",
+                            (broker_id, payload.booking_id),
+                        )
+                        conn.commit()
+                        booking = service.get_booking(payload.booking_id) or booking
+
             tds_record = tds_service.process_booking_for_tds(payload.booking_id)
             commission_record = None
-            if payload.broker_id and payload.broker_id.strip():
+            effective_broker_id = str(booking.get("broker_id") or "").strip()
+            if effective_broker_id:
                 commission_record = commission_service.create_commission_for_booking(
                     booking_id=payload.booking_id,
-                    broker_id=payload.broker_id,
+                    broker_id=effective_broker_id,
                 )
         except ValueError as exc:
             raise HTTPException(status_code=422, detail=str(exc)) from exc

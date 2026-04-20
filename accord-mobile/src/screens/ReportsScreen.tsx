@@ -2,6 +2,7 @@ import React, { useEffect, useMemo, useState } from "react";
 import { FlatList, StyleSheet, Text, TouchableOpacity, View } from "react-native";
 import { useQuery } from "@tanstack/react-query";
 import mobileApi, { subscribeOfflineBanner } from "../api/axios";
+import MobileCashflowChart from "../components/MobileCashflowChart";
 
 type Language = "en" | "hi" | "pa" | "ur";
 
@@ -163,6 +164,7 @@ export default function ReportsScreen({ language, onSelectReport }: Props) {
 
   return (
     <View style={styles.container}>
+      <MobileCashflowChart />
       {offlineBanner.visible ? (
         <View style={styles.offlineBanner}>
           <Text style={styles.offlineBannerText}>{offlineBanner.message}</Text>
