@@ -10,6 +10,7 @@ from pydantic import BaseModel, Field
 
 from services.gstn_sandbox_api import GstnSandboxApi
 from services.universal_accounting import DEFAULT_BUSINESS_ID, get_transactions_between
+from utils.feature_flags import is_feature_enabled
 from utils.gstr1_generator import generate_gstr1_payload
 
 
@@ -37,6 +38,8 @@ def create_gstn_sandbox_router(get_conn: Callable[[], sqlite3.Connection], requi
         x_role: str | None = Header(default=None, alias="X-Role"),
         x_admin_id: str | None = Header(default=None, alias="X-Admin-Id"),
     ) -> dict[str, Any]:
+        if not is_feature_enabled("gstn_sandbox_api", default=True):
+            raise HTTPException(status_code=503, detail="Service Unavailable: Maintenance Mode")
         require_role(x_role, {"admin", "ca"})
         require_admin_id(x_admin_id)
 

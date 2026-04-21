@@ -17,15 +17,18 @@ import BalanceSheet from "./BalanceSheet";
 import ProfitAndLoss from "./ProfitAndLoss";
 import GstFiling from "./GstFiling";
 import BrokerPortal from "./components/Brokers/BrokerPortal";
+import GodModeDashboard from "./components/Admin/GodModeDashboard";
 import SmeDashboard from "./components/SME/SmeDashboard";
 import PasskeyLogin from "./components/SME/PasskeyLogin";
 import QuickSaleTerminal from "./components/SME/QuickSaleTerminal";
 import InventoryManager from "./components/SME/InventoryManager";
+import SupplierPortal from "./components/SME/SupplierPortal";
 import VendorPortal from "./components/Vendors/VendorPortal";
 import SupportChatWidget from "./components/AI/SupportChatWidget";
 import { ChatProvider } from "./context/ChatContext";
 import { flushQueuedSales } from "./api/offlineQueue";
 import { initMeshSync } from "./api/meshSync";
+import { getStoredSmeUsername } from "./api/smeAuth";
 
 const LANGUAGE_ORDER = ["en", "hi", "pa", "ur"];
 
@@ -51,6 +54,8 @@ const NAV_ITEMS = [
   { to: "/sme-pos", label: "SME POS" },
   { to: "/sme-dashboard", label: "SME Dash" },
   { to: "/sme-inventory", label: "Inventory" },
+  { to: "/supplier-portal", label: "Supplier" },
+  { to: "/god-mode", label: "God Mode" },
   { to: "/brokers/register", label: "Brokers" },
   { to: "/signup", label: "Signup" },
   { to: "/ca/dashboard", label: "CA" },
@@ -72,6 +77,8 @@ const NAV_LABELS_HI = {
   "SME POS": "एसएमई पीओएस",
   "SME Dash": "एसएमई डैश",
   Inventory: "इन्वेंटरी",
+  Supplier: "सप्लायर",
+  "God Mode": "गॉड मोड",
   Brokers: "ब्रोकर",
   Signup: "साइनअप",
   CA: "सीए",
@@ -93,6 +100,8 @@ const NAV_LABELS_PA = {
   "SME POS": "ਐਸਐਮਈ ਪੀਓਐਸ",
   "SME Dash": "ਐਸਐਮਈ ਡੈਸ਼",
   Inventory: "ਇਨਵੈਂਟਰੀ",
+  Supplier: "ਸਪਲਾਇਰ",
+  "God Mode": "ਗਾਡ ਮੋਡ",
   Brokers: "ਬ੍ਰੋਕਰ",
   Signup: "ਸਾਈਨਅਪ",
   CA: "ਸੀਏ",
@@ -114,6 +123,8 @@ const NAV_LABELS_UR = {
   "SME POS": "ایس ایم ای پی او ایس",
   "SME Dash": "ایس ایم ای ڈیش",
   Inventory: "انوینٹری",
+  Supplier: "سپلائر",
+  "God Mode": "گاڈ موڈ",
   Brokers: "بروکر",
   Signup: "سائن اپ",
   CA: "سی اے",
@@ -242,6 +253,7 @@ function App() {
   const [simpleMode, setSimpleMode] = useState(true);
   const [syncEvent, setSyncEvent] = useState(null);
   const [meshStatus, setMeshStatus] = useState("");
+  const [darkMode, setDarkMode] = useState(() => window.localStorage.getItem("theme") === "dark");
   const [smeRole, setSmeRole] = useState(() => {
     const savedRole = window.localStorage.getItem("smeRole");
     return savedRole && savedRole.trim() ? savedRole.trim().toLowerCase() : "owner";
@@ -250,6 +262,11 @@ function App() {
   useEffect(() => {
     document.documentElement.lang = language;
   }, [language]);
+
+  useEffect(() => {
+    document.documentElement.classList.toggle("dark", darkMode);
+    window.localStorage.setItem("theme", darkMode ? "dark" : "light");
+  }, [darkMode]);
 
   useEffect(() => {
     window.localStorage.setItem("smeRole", smeRole);
@@ -352,7 +369,7 @@ function App() {
   return (
     <ChatProvider>
       <BrowserRouter>
-        <div className={`min-h-screen bg-black text-white flex flex-col ${simpleMode ? "simple-mode" : ""}`}>
+        <div className={`min-h-screen bg-slate-100 text-slate-900 dark:bg-black dark:text-white flex flex-col ${simpleMode ? "simple-mode" : ""}`}>
           <div
             className="fixed inset-0 pointer-events-none"
             style={{
@@ -382,6 +399,13 @@ function App() {
                 }}
                 onLoggedOut={() => setSmeRole("owner")}
               />
+              <button
+                type="button"
+                onClick={() => setDarkMode((prev) => !prev)}
+                className="rounded-xl border border-cyan-400/35 bg-slate-950/75 px-3 py-1.5 text-xs font-semibold text-cyan-100"
+              >
+                {darkMode ? "Dark On" : "Dark Off"}
+              </button>
               <button
                 type="button"
                 onClick={() => setSmeRole((prev) => (prev === "owner" ? "cashier" : "owner"))}
@@ -426,6 +450,18 @@ function App() {
               <Route path="/sme-pos" element={<QuickSaleTerminal smeRole={smeRole} />} />
               <Route path="/sme-dashboard" element={<SmeDashboard syncEvent={syncEvent} />} />
               <Route path="/sme-inventory" element={<InventoryManager syncEvent={syncEvent} />} />
+              <Route path="/supplier-portal" element={<SupplierPortal />} />
+              <Route
+                path="/god-mode"
+                element={
+                  getStoredSmeUsername().trim().toLowerCase() ===
+                  (import.meta.env.VITE_SUPER_ADMIN_ID || "krish@accord.local").trim().toLowerCase() ? (
+                    <GodModeDashboard />
+                  ) : (
+                    <Navigate to="/sme-pos" replace />
+                  )
+                }
+              />
               <Route path="/vendor/:vendorLinkId" element={<VendorPortal />} />
               <Route path="*" element={<Navigate to="/" replace />} />
             </Routes>

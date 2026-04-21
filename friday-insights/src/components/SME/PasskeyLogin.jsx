@@ -63,6 +63,7 @@ export default function PasskeyLogin({ role: roleProp, onAuthenticated, onLogged
         role: verification.role || role,
         sessionToken: verification.session_token,
         username: verification.username || username,
+        accessToken: verification.access_token,
       });
       setStatus(`Passkey enrolled for ${verification.username || username}`);
       onAuthenticated?.(verification);
@@ -91,6 +92,7 @@ export default function PasskeyLogin({ role: roleProp, onAuthenticated, onLogged
         role: verification.role || role,
         sessionToken: verification.session_token,
         username: verification.username,
+        accessToken: verification.access_token,
       });
       setStatus(`Authenticated as ${verification.username}`);
       onAuthenticated?.(verification);

@@ -269,31 +269,31 @@ export default function QuickSaleTerminal({ smeRole: smeRoleProp }) {
   };
 
   return (
-    <div className="min-h-screen bg-slate-950 text-white px-4 py-6 md:px-8 md:py-10">
+    <div className="min-h-screen bg-slate-100 text-slate-900 dark:bg-slate-950 dark:text-white px-4 py-6 md:px-8 md:py-10">
       <div className="mx-auto w-full max-w-4xl">
-        <div className="rounded-3xl border border-emerald-300/25 bg-emerald-500/10 px-5 py-4 md:px-8 md:py-6 mb-6">
-          <p className="text-sm md:text-base text-emerald-100/90">Today&apos;s Total</p>
+        <div className="rounded-3xl border border-emerald-300 bg-emerald-100/80 dark:border-emerald-300/25 dark:bg-emerald-500/10 px-5 py-4 md:px-8 md:py-6 mb-6">
+          <p className="text-sm md:text-base text-emerald-800 dark:text-emerald-100/90">Today&apos;s Total</p>
           <p className="text-4xl md:text-6xl font-black tracking-tight mt-2">{formatCurrency(todaysTotal)}</p>
         </div>
 
         <div className="grid grid-cols-1 lg:grid-cols-[1fr_340px] gap-6">
-          <div className="rounded-3xl border border-slate-700 bg-slate-900/80 p-5 md:p-8">
-            <div className="rounded-2xl border border-cyan-300/25 bg-black/60 px-5 py-5 md:px-7 md:py-7 mb-5">
-              <p className="text-xs uppercase tracking-[0.18em] text-slate-400">Amount</p>
+          <div className="rounded-3xl border border-slate-300 bg-white dark:border-slate-700 dark:bg-slate-900/80 p-5 md:p-8">
+            <div className="rounded-2xl border border-cyan-300/40 bg-slate-100 dark:border-cyan-300/25 dark:bg-black/60 px-5 py-5 md:px-7 md:py-7 mb-5">
+              <p className="text-xs uppercase tracking-[0.18em] text-slate-500 dark:text-slate-400">Amount</p>
               <input
                 ref={amountInputRef}
                 value={displayValue}
                 onChange={onAmountInputChange}
-                className="w-full bg-transparent border-none outline-none text-5xl md:text-7xl font-black mt-2 text-cyan-200 leading-none"
+                className="w-full bg-transparent border-none outline-none text-5xl md:text-7xl font-black mt-2 text-cyan-700 dark:text-cyan-200 leading-none"
                 inputMode="decimal"
                 aria-label="POS amount input"
               />
             </div>
 
             {cartItems.length > 0 ? (
-              <div className="mb-5 rounded-2xl border border-slate-700 bg-slate-950/70 px-4 py-4">
-                <p className="text-xs uppercase tracking-[0.16em] text-slate-400 mb-2">Scanned Cart</p>
-                <div className="space-y-1 text-sm text-slate-200">
+              <div className="mb-5 rounded-2xl border border-slate-300 bg-slate-50 dark:border-slate-700 dark:bg-slate-950/70 px-4 py-4">
+                <p className="text-xs uppercase tracking-[0.16em] text-slate-500 dark:text-slate-400 mb-2">Scanned Cart</p>
+                <div className="space-y-1 text-sm text-slate-700 dark:text-slate-200">
                   {cartItems.map((item) => (
                     <div key={item.system_serial} className="flex justify-between">
                       <span>{item.item_name} x {item.quantity}</span>
