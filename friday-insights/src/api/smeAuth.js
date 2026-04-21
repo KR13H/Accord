@@ -1,6 +1,7 @@
 const SME_ROLE_KEY = "smeRole";
 const SME_SESSION_KEY = "smeSessionToken";
 const SME_USERNAME_KEY = "smePasskeyUsername";
+const SME_ACCESS_TOKEN_KEY = "smeAccessToken";
 
 export function getStoredSmeRole() {
   const role = window.localStorage.getItem(SME_ROLE_KEY);
@@ -15,7 +16,11 @@ export function getStoredSmeUsername() {
   return window.localStorage.getItem(SME_USERNAME_KEY) || "";
 }
 
-export function persistSmeSession({ role, sessionToken, username }) {
+export function getStoredSmeAccessToken() {
+  return window.localStorage.getItem(SME_ACCESS_TOKEN_KEY) || "";
+}
+
+export function persistSmeSession({ role, sessionToken, username, accessToken }) {
   if (role) {
     window.localStorage.setItem(SME_ROLE_KEY, role.trim().toLowerCase());
   }
@@ -25,10 +30,14 @@ export function persistSmeSession({ role, sessionToken, username }) {
   if (username) {
     window.localStorage.setItem(SME_USERNAME_KEY, username);
   }
+  if (accessToken) {
+    window.localStorage.setItem(SME_ACCESS_TOKEN_KEY, accessToken);
+  }
 }
 
 export function clearSmeSession() {
   window.localStorage.removeItem(SME_SESSION_KEY);
+  window.localStorage.removeItem(SME_ACCESS_TOKEN_KEY);
 }
 
 export function buildSmeHeaders(extraHeaders = {}, overrides = {}) {

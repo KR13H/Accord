@@ -5,6 +5,7 @@ import os
 import sqlite3
 import threading
 import uuid
+import re
 from datetime import datetime, timedelta
 from typing import Any, Callable
 
@@ -18,6 +19,7 @@ from webauthn import (
 )
 from webauthn.helpers import base64url_to_bytes, bytes_to_base64url, options_to_json
 
+from services.onboarding_service import inject_demo_data
 from utils.jwt_manager import mint_access_token, mint_refresh_token, refresh_cookie_name
 from utils.sme_auth import mint_sme_session_token
 
@@ -100,6 +102,13 @@ def _set_refresh_cookie(response: Response, refresh_token: str, refresh_exp: int
 
 def _clean_origin_list() -> list[str]:
     return WEBAUTHN_ALLOWED_ORIGINS or ["http://localhost:5173"]
+
+
+def _business_id_from_username(username: str) -> str:
+    compact = re.sub(r"[^A-Za-z0-9]+", "-", username.strip()).strip("-").upper()
+    if not compact:
+        compact = "NEW-SME"
+    return f"SME-{compact[:24]}"
 
 
 def _store_challenge(*, operation: str, payload: dict[str, Any]) -> str:
@@ -246,6 +255,8 @@ def create_sme_webauthn_router(get_conn: Callable[[], sqlite3.Connection]) -> AP
             conn.commit()
 
         _consume_challenge(payload.challenge_id)
+        business_id = _business_id_from_username(str(challenge["username"]))
+        onboarding = inject_demo_data(get_conn, business_id)
         session_token = mint_sme_session_token(
             username=str(challenge["username"]),
             role=str(challenge["role"]),
@@ -275,6 +286,8 @@ def create_sme_webauthn_router(get_conn: Callable[[], sqlite3.Connection]) -> AP
             "access_token_expires_at": access_exp,
             "token_type": "bearer",
             "session_token": session_token,
+            "business_id": business_id,
+            "onboarding": onboarding,
             "user_verified": bool(verified.user_verified),
         }
 

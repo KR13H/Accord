@@ -127,29 +127,29 @@ export default function SmeDashboard({ syncEvent }) {
   const totalWeekRevenue = useMemo(() => weeklyRows.reduce((sum, row) => sum + row.income, 0), [weeklyRows]);
 
   return (
-    <div className="min-h-screen bg-slate-950 text-white px-4 py-6 md:px-8 md:py-10">
+    <div className="min-h-screen bg-slate-100 text-slate-900 dark:bg-slate-950 dark:text-white px-4 py-6 md:px-8 md:py-10">
       <div className="mx-auto max-w-6xl">
         <div className="mb-6">
-          <p className="text-xs uppercase tracking-[0.18em] text-cyan-300">SME Command Center</p>
+          <p className="text-xs uppercase tracking-[0.18em] text-cyan-700 dark:text-cyan-300">SME Command Center</p>
           <h1 className="text-3xl md:text-4xl font-black mt-2">Sales Analytics Dashboard</h1>
         </div>
 
         <div className="grid grid-cols-1 md:grid-cols-3 gap-4 md:gap-5 mb-6">
-          <div className="rounded-3xl border border-emerald-300/30 bg-emerald-500/10 p-5 md:p-6">
-            <p className="text-sm text-emerald-100/90">Today&apos;s Revenue</p>
+          <div className="rounded-3xl border border-emerald-300 bg-emerald-100/80 dark:border-emerald-300/30 dark:bg-emerald-500/10 p-5 md:p-6">
+            <p className="text-sm text-emerald-800 dark:text-emerald-100/90">Today&apos;s Revenue</p>
             <p className="text-3xl md:text-5xl font-black mt-2">{formatCurrency(todayRevenue)}</p>
           </div>
-          <div className="rounded-3xl border border-cyan-300/30 bg-cyan-500/10 p-5 md:p-6">
-            <p className="text-sm text-cyan-100/90">Total Transactions</p>
+          <div className="rounded-3xl border border-cyan-300 bg-cyan-100/80 dark:border-cyan-300/30 dark:bg-cyan-500/10 p-5 md:p-6">
+            <p className="text-sm text-cyan-800 dark:text-cyan-100/90">Total Transactions</p>
             <p className="text-3xl md:text-5xl font-black mt-2">{todayTransactions}</p>
           </div>
-          <div className="rounded-3xl border border-indigo-300/30 bg-indigo-500/10 p-5 md:p-6">
-            <p className="text-sm text-indigo-100/90">Last 7 Days Revenue</p>
+          <div className="rounded-3xl border border-indigo-300 bg-indigo-100/80 dark:border-indigo-300/30 dark:bg-indigo-500/10 p-5 md:p-6">
+            <p className="text-sm text-indigo-800 dark:text-indigo-100/90">Last 7 Days Revenue</p>
             <p className="text-3xl md:text-5xl font-black mt-2">{formatCurrency(totalWeekRevenue)}</p>
           </div>
         </div>
 
-        <div className="rounded-3xl border border-slate-700 bg-slate-900/80 p-4 md:p-6">
+        <div className="rounded-3xl border border-slate-300 bg-white dark:border-slate-700 dark:bg-slate-900/80 p-4 md:p-6">
           <div className="h-[380px] md:h-[420px] w-full">
             {loading ? (
               <div className="h-full flex items-center justify-center text-slate-300">Loading weekly chart...</div>
@@ -174,17 +174,17 @@ export default function SmeDashboard({ syncEvent }) {
           </div>
         </div>
 
-        <div className="rounded-3xl border border-slate-700 bg-slate-900/80 p-4 md:p-6 mt-6">
-          <h2 className="text-xl md:text-2xl font-black text-cyan-100 mb-3">Predictive Restock (Next 7 Days)</h2>
+        <div className="rounded-3xl border border-slate-300 bg-white dark:border-slate-700 dark:bg-slate-900/80 p-4 md:p-6 mt-6">
+          <h2 className="text-xl md:text-2xl font-black text-cyan-700 dark:text-cyan-100 mb-3">Predictive Restock (Next 7 Days)</h2>
           {predictions.length === 0 ? (
-            <p className="text-slate-300 text-sm">No prediction data yet. Record a few days of sales to unlock restock AI.</p>
+            <p className="text-slate-600 dark:text-slate-300 text-sm">No prediction data yet. Record a few days of sales to unlock restock AI.</p>
           ) : (
             <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
               {predictions.slice(0, 8).map((prediction, index) => (
-                <div key={`${prediction.item_name}-${index}`} className="rounded-2xl border border-cyan-400/25 bg-cyan-500/10 p-4">
-                  <p className="text-cyan-100 font-semibold">{prediction.item_name}</p>
+                <div key={`${prediction.item_name}-${index}`} className="rounded-2xl border border-cyan-300 bg-cyan-100/70 dark:border-cyan-400/25 dark:bg-cyan-500/10 p-4">
+                  <p className="text-cyan-900 dark:text-cyan-100 font-semibold">{prediction.item_name}</p>
                   <p className="text-2xl font-black mt-1">Order {prediction.predicted_order_qty}</p>
-                  <p className="text-xs text-cyan-50/80 mt-2">{prediction.justification}</p>
+                  <p className="text-xs text-cyan-900/80 dark:text-cyan-50/80 mt-2">{prediction.justification}</p>
                 </div>
               ))}
             </div>

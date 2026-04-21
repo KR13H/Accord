@@ -18,6 +18,7 @@ from services.sme_inventory_service import (
     list_items,
     update_item,
 )
+from utils.feature_flags import is_feature_enabled
 from utils.rate_limit import build_rate_limit_dependency
 
 
@@ -111,6 +112,8 @@ def create_sme_inventory_router(get_conn: Callable[[], sqlite3.Connection]) -> A
 
     @router.post("/vision-scan")
     def post_inventory_vision_scan(payload: VisionScanIn, _: bool = Depends(rate_limit_vision_scan)) -> dict[str, Any]:
+        if not is_feature_enabled("ai_vision_service", default=True):
+            raise HTTPException(status_code=503, detail="Service Unavailable: Maintenance Mode")
         try:
             result = vision_scan_inventory(
                 get_conn,

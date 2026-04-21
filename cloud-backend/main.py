@@ -94,6 +94,8 @@ except ModuleNotFoundError:  # pragma: no cover
 from routes.sme_inventory_routes import create_sme_inventory_router
 from routes.iot_telemetry_routes import create_iot_telemetry_router
 from routes.sme_payable_routes import create_sme_payable_router
+from routes.supplier_routes import create_supplier_router
+from routes.superadmin_routes import create_superadmin_router
 from routes.sme_routes import create_sme_router
 from routes.support_routes import router as support_router
 from routes.tds_routes import create_phase7_router
@@ -4075,11 +4077,13 @@ app.include_router(support_router)
 app.include_router(create_sme_router(get_conn))
 app.include_router(create_sme_inventory_router(get_conn))
 app.include_router(create_sme_payable_router(get_conn))
+app.include_router(create_supplier_router(get_conn))
 app.include_router(create_autonomous_purchasing_router(get_conn))
 app.include_router(create_iot_telemetry_router(get_conn))
 app.include_router(create_sme_webauthn_router(get_conn))
 app.include_router(create_otp_auth_router(get_conn))
 app.include_router(create_gstn_sandbox_router(get_conn, require_role, require_admin_id))
+app.include_router(create_superadmin_router(get_conn))
 app.include_router(create_sme_sync_router())
 
 
